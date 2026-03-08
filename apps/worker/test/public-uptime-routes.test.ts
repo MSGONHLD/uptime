@@ -298,3 +298,124 @@ describe('public incident feed regression', () => {
     });
   });
 });
+
+describe('public route cache/auth regression', () => {
+  const originalCaches = (globalThis as { caches?: unknown }).caches;
+
+  afterEach(() => {
+    if (originalCaches === undefined) {
+      delete (globalThis as { caches?: unknown }).caches;
+    } else {
+      Object.defineProperty(globalThis, 'caches', {
+        configurable: true,
+        value: originalCaches,
+      });
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('bypasses anonymous cache entries for authorized incident requests', async () => {
+    const store = new Map<string, Response>();
+    installCacheMock(store);
+    const now = 1_728_530_000;
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: (sql) =>
+          sql.includes('from incidents') &&
+          sql.includes("where status != 'resolved'") &&
+          sql.includes('show_on_status_page = 1'),
+        all: () => [
+          {
+            id: 2,
+            title: 'Shared API latency',
+            status: 'monitoring',
+            impact: 'minor',
+            message: 'Customer-visible',
+            started_at: now - 300,
+            resolved_at: null,
+          },
+        ],
+      },
+      {
+        match: (sql) =>
+          sql.includes('from incidents') &&
+          sql.includes("where status != 'resolved'") &&
+          sql.includes('1 = 1'),
+        all: () => [
+          {
+            id: 1,
+            title: 'Private control plane outage',
+            status: 'identified',
+            impact: 'major',
+            message: 'Internal only',
+            started_at: now - 120,
+            resolved_at: null,
+          },
+        ],
+      },
+      {
+        match: 'from incident_updates',
+        all: () => [],
+      },
+      {
+        match: 'from incident_monitors',
+        all: () => [
+          { incident_id: 1, monitor_id: 22 },
+          { incident_id: 2, monitor_id: 11 },
+        ],
+      },
+      {
+        match: (sql) => sql.includes('from monitors') && sql.includes('show_on_status_page = 1'),
+        all: () => [{ id: 11 }],
+      },
+    ];
+
+    const anonymous = await requestPublic('/incidents?limit=1', handlers);
+    expect(anonymous.res.status).toBe(200);
+    expect(anonymous.body).toMatchObject({
+      incidents: [
+        {
+          id: 2,
+          monitor_ids: [11],
+        },
+      ],
+    });
+
+    const cachedAnonymous = store.get('https://status.example.com/incidents?limit=1')?.clone();
+    expect(cachedAnonymous).toBeDefined();
+    expect(await cachedAnonymous?.json()).toMatchObject({
+      incidents: [
+        {
+          id: 2,
+        },
+      ],
+    });
+
+    const admin = await requestPublic('/incidents?limit=1', handlers, {
+      adminToken: 'secret-token',
+      authorization: 'Bearer secret-token',
+    });
+
+    expect(admin.res.status).toBe(200);
+    expect(admin.res.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(admin.res.headers.get('Vary')).toContain('Authorization');
+    expect(admin.body).toMatchObject({
+      incidents: [
+        {
+          id: 1,
+          monitor_ids: [22],
+        },
+      ],
+    });
+
+    const cachedAfterAdmin = store.get('https://status.example.com/incidents?limit=1')?.clone();
+    expect(await cachedAfterAdmin?.json()).toMatchObject({
+      incidents: [
+        {
+          id: 2,
+        },
+      ],
+    });
+  });
+});
