@@ -281,7 +281,10 @@ async function buildHomepageMonitorData(
   const monitors = new Array<HomepageMonitorCard>(rawMonitors.length);
   const monitorIndexById = new Map<number, number>();
   for (let index = 0; index < rawMonitors.length; index += 1) {
-    const monitor = toHomepageMonitorCard(rawMonitors[index], now, maintenanceMonitorIds);
+    const row = rawMonitors[index];
+    if (!row) continue;
+
+    const monitor = toHomepageMonitorCard(row, now, maintenanceMonitorIds);
     monitors[index] = monitor;
     monitorIndexById.set(monitor.id, index);
     summary[monitor.status] += 1;
@@ -367,9 +370,12 @@ async function buildHomepageMonitorData(
     if (index === undefined) continue;
 
     const monitor = monitors[index];
+    const statusCodes = heartbeatStatusCodes[index];
+    if (!monitor || !statusCodes) continue;
+
     monitor.heartbeat_strip.checked_at.push(row.checked_at);
     monitor.heartbeat_strip.latency_ms.push(row.latency_ms);
-    heartbeatStatusCodes[index].push(toHeartbeatStatusCode(row.status));
+    statusCodes.push(toHeartbeatStatusCode(row.status));
   }
 
   const totalsByMonitor = Array.from({ length: monitors.length }, () => ({
@@ -380,11 +386,16 @@ async function buildHomepageMonitorData(
     const index = monitorIndexById.get(row.monitor_id);
     if (index === undefined) continue;
 
-    addUptimeDay(monitors[index], totalsByMonitor[index], row.day_start_at, {
+    const monitor = monitors[index];
+    const totals = totalsByMonitor[index];
+    if (!monitor || !totals) continue;
+
+    addUptimeDay(monitor, totals, row.day_start_at, {
       total_sec: row.total_sec ?? 0,
       downtime_sec: row.downtime_sec ?? 0,
       unknown_sec: row.unknown_sec ?? 0,
       uptime_sec: row.uptime_sec ?? 0,
+      uptime_pct: toUptimePct(row.total_sec ?? 0, row.uptime_sec ?? 0),
     });
   }
 
@@ -392,15 +403,21 @@ async function buildHomepageMonitorData(
     for (const [monitorId, today] of todayByMonitorId) {
       const index = monitorIndexById.get(monitorId);
       if (index === undefined) continue;
-      addUptimeDay(monitors[index], totalsByMonitor[index], todayStartAt, today);
+      const monitor = monitors[index];
+      const totals = totalsByMonitor[index];
+      if (!monitor || !totals) continue;
+      addUptimeDay(monitor, totals, todayStartAt, today);
     }
   }
 
   for (let index = 0; index < monitors.length; index += 1) {
-    monitors[index].heartbeat_strip.status_codes = heartbeatStatusCodes[index].join('');
-
+    const monitor = monitors[index];
+    const statusCodes = heartbeatStatusCodes[index];
     const totals = totalsByMonitor[index];
-    monitors[index].uptime_30d =
+    if (!monitor || !statusCodes || !totals) continue;
+
+    monitor.heartbeat_strip.status_codes = statusCodes.join('');
+    monitor.uptime_30d =
       totals.totalSec === 0
         ? null
         : {

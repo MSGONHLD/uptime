@@ -117,10 +117,6 @@ describe('public homepage route', () => {
 
   it('serves a fresh homepage snapshot without live compute', async () => {
     const payload = samplePayload(190);
-    const stored = {
-      version: 3,
-      data: payload,
-    };
     vi.spyOn(Date, 'now').mockReturnValue(200_000);
 
     const res = await requestHomepage([
@@ -130,7 +126,7 @@ describe('public homepage route', () => {
           args[0] === 'homepage'
             ? {
                 generated_at: payload.generated_at,
-                body_json: JSON.stringify(stored),
+                body_json: JSON.stringify(payload),
               }
             : null,
       },
@@ -158,10 +154,7 @@ describe('public homepage route', () => {
           args[0] === 'homepage:artifact'
             ? {
                 generated_at: payload.generated_at,
-                body_json: JSON.stringify({
-                  version: 3,
-                  render,
-                }),
+                body_json: JSON.stringify(render),
               }
             : null,
       },

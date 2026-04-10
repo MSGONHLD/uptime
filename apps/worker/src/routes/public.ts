@@ -19,11 +19,11 @@ import {
 import {
   applyHomepageCacheHeaders,
   applyStatusCacheHeaders,
-  readHomepageSnapshot,
-  readHomepageSnapshotArtifact,
+  readHomepageSnapshotArtifactJson,
+  readHomepageSnapshotJson,
   readStatusSnapshot,
-  readStaleHomepageSnapshot,
-  readStaleHomepageSnapshotArtifact,
+  readStaleHomepageSnapshotArtifactJson,
+  readStaleHomepageSnapshotJson,
   toSnapshotPayload,
   writeStatusSnapshot,
 } from '../snapshots';
@@ -537,16 +537,20 @@ publicRoutes.get('/status', async (c) => {
 
 publicRoutes.get('/homepage', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshot(c.env.DB, now);
+  const snapshot = await readHomepageSnapshotJson(c.env.DB, now);
   if (snapshot) {
-    const res = c.json(snapshot.data);
+    const res = new Response(snapshot.bodyJson, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    });
     applyHomepageCacheHeaders(res, snapshot.age);
     return res;
   }
 
-  const stale = await readStaleHomepageSnapshot(c.env.DB, now);
+  const stale = await readStaleHomepageSnapshotJson(c.env.DB, now);
   if (stale) {
-    const res = c.json(stale.data);
+    const res = new Response(stale.bodyJson, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    });
     applyHomepageCacheHeaders(res, Math.min(60, stale.age));
     return res;
   }
@@ -556,16 +560,20 @@ publicRoutes.get('/homepage', async (c) => {
 
 publicRoutes.get('/homepage-artifact', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshotArtifact(c.env.DB, now);
+  const snapshot = await readHomepageSnapshotArtifactJson(c.env.DB, now);
   if (snapshot) {
-    const res = c.json(snapshot.data);
+    const res = new Response(snapshot.bodyJson, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    });
     applyHomepageCacheHeaders(res, snapshot.age);
     return res;
   }
 
-  const stale = await readStaleHomepageSnapshotArtifact(c.env.DB, now);
+  const stale = await readStaleHomepageSnapshotArtifactJson(c.env.DB, now);
   if (stale) {
-    const res = c.json(stale.data);
+    const res = new Response(stale.bodyJson, {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    });
     applyHomepageCacheHeaders(res, Math.min(60, stale.age));
     return res;
   }

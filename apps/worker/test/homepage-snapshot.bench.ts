@@ -1,8 +1,12 @@
 import { writeFile } from 'node:fs/promises';
 
+import { Hono } from 'hono';
 import { describe, expect, it } from 'vitest';
 
 import { computePublicHomepagePayload } from '../src/public/homepage';
+import type { Env } from '../src/env';
+import { handleError, handleNotFound } from '../src/middleware/errors';
+import { publicRoutes } from '../src/routes/public';
 import { buildHomepageRenderArtifact } from '../src/snapshots/public-homepage';
 import { createFakeD1Database, type FakeD1QueryHandler } from './helpers/fake-d1';
 import pageWorker from '../../web/public/_worker.js';
@@ -33,6 +37,17 @@ type RootMissSample = {
   snapshotKB: number;
 };
 
+type RouteReadScenario = {
+  name: string;
+  endpoint: 'homepage' | 'homepage-artifact';
+  monitorCount: number;
+};
+
+type RouteReadSample = {
+  elapsedMs: number;
+  bodyKB: number;
+};
+
 const BENCH_LABEL = process.env.HOMEPAGE_BENCH_LABEL ?? 'current-working-tree';
 const OUTPUT_PATH = process.env.HOMEPAGE_BENCH_OUTPUT ?? null;
 
@@ -45,6 +60,13 @@ const ROOT_MISS_SCENARIOS: RootMissScenario[] = [
   { name: '50 monitors', monitorCount: 50 },
   { name: '100 monitors', monitorCount: 100 },
   { name: '250 monitors', monitorCount: 250 },
+];
+
+const ROUTE_READ_SCENARIOS: RouteReadScenario[] = [
+  { name: 'homepage / 250 monitors', endpoint: 'homepage', monitorCount: 250 },
+  { name: 'homepage / 1000 monitors', endpoint: 'homepage', monitorCount: 1000 },
+  { name: 'homepage-artifact / 250 monitors', endpoint: 'homepage-artifact', monitorCount: 250 },
+  { name: 'homepage-artifact / 1000 monitors', endpoint: 'homepage-artifact', monitorCount: 1000 },
 ];
 
 function parsePositiveIntEnv(name: string, fallback: number): number {
@@ -346,10 +368,87 @@ function summarizeRootMiss(scenario: RootMissScenario, samples: RootMissSample[]
   };
 }
 
+async function runOneRouteRead(scenario: RouteReadScenario): Promise<RouteReadSample> {
+  const now = 1_728_000_000;
+  const payload = buildSyntheticHomepagePayload(scenario.monitorCount, 30, 14, now);
+  const artifact = buildHomepageRenderArtifact(payload);
+  const bodyJson = scenario.endpoint === 'homepage' ? JSON.stringify(payload) : JSON.stringify(artifact);
+  const key = scenario.endpoint === 'homepage' ? 'homepage' : 'homepage:artifact';
+  const originalCaches = globalThis.caches;
+
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: {
+      open: async () => ({
+        match: async () => undefined,
+        put: async () => undefined,
+      }),
+    },
+  });
+
+  try {
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshots',
+          first: (args) =>
+            args[0] === key
+              ? {
+                  generated_at: now,
+                  body_json: bodyJson,
+                }
+              : null,
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+    } as unknown as Env;
+
+    const app = new Hono<{ Bindings: Env }>();
+    app.onError(handleError);
+    app.notFound(handleNotFound);
+    app.route('/api/v1/public', publicRoutes);
+
+    const started = performance.now();
+    const response = await app.fetch(
+      new Request(`https://status.example.com/api/v1/public/${scenario.endpoint}`),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+    await response.text();
+    const elapsedMs = performance.now() - started;
+
+    return {
+      elapsedMs,
+      bodyKB: Number((bodyJson.length / 1024).toFixed(1)),
+    };
+  } finally {
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: originalCaches,
+    });
+  }
+}
+
+function summarizeRouteRead(scenario: RouteReadScenario, samples: RouteReadSample[]) {
+  const elapsed = samples.map((sample) => sample.elapsedMs).sort((a, b) => a - b);
+  const totalElapsed = elapsed.reduce((sum, value) => sum + value, 0);
+  const first = samples[0];
+
+  return {
+    scenario: scenario.name,
+    runs: samples.length,
+    meanMs: Number((totalElapsed / samples.length).toFixed(3)),
+    medianMs: Number(percentile(elapsed, 0.5).toFixed(3)),
+    p95Ms: Number(percentile(elapsed, 0.95).toFixed(3)),
+    bodyKB: first?.bodyKB ?? 0,
+  };
+}
+
 describe('homepage snapshot benchmark', () => {
   it('measures homepage snapshot compute cost', async () => {
     const rows = [];
     const rootMissRows = [];
+    const routeReadRows = [];
 
     for (const scenario of SCENARIOS) {
       for (let index = 0; index < WARMUP_RUNS; index += 1) {
@@ -377,6 +476,19 @@ describe('homepage snapshot benchmark', () => {
       rootMissRows.push(summarizeRootMiss(scenario, samples));
     }
 
+    for (const scenario of ROUTE_READ_SCENARIOS) {
+      for (let index = 0; index < WARMUP_RUNS; index += 1) {
+        await runOneRouteRead(scenario);
+      }
+
+      const samples: RouteReadSample[] = [];
+      for (let index = 0; index < MEASURE_RUNS; index += 1) {
+        samples.push(await runOneRouteRead(scenario));
+      }
+
+      routeReadRows.push(summarizeRouteRead(scenario, samples));
+    }
+
     console.log('Homepage snapshot benchmark');
     console.log(`Label: ${BENCH_LABEL}`);
     if (process.env.HOMEPAGE_BENCH_RUNS || process.env.HOMEPAGE_BENCH_WARMUPS) {
@@ -389,11 +501,14 @@ describe('homepage snapshot benchmark', () => {
     console.log('');
     console.log('Pages homepage root miss benchmark');
     console.table(rootMissRows);
+    console.log('');
+    console.log('Worker homepage route read benchmark');
+    console.table(routeReadRows);
 
     if (OUTPUT_PATH) {
       await writeFile(
         OUTPUT_PATH,
-        JSON.stringify({ snapshotCompute: rows, rootMiss: rootMissRows }, null, 2),
+        JSON.stringify({ snapshotCompute: rows, rootMiss: rootMissRows, routeRead: routeReadRows }, null, 2),
         'utf8',
       );
       console.log(`Wrote raw benchmark data to ${OUTPUT_PATH}`);
