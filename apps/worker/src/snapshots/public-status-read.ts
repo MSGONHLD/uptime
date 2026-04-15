@@ -9,14 +9,51 @@ const READ_STATUS_SQL = `
   FROM public_snapshots
   WHERE key = ?1
 `;
+const READ_STATUS_METADATA_SQL = `
+  SELECT generated_at, updated_at
+  FROM public_snapshots
+  WHERE key = ?1
+`;
 
 const readStatusStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const readStatusMetadataStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const normalizedStatusCacheByDb = new WeakMap<D1Database, StatusSnapshotCacheEntry>();
 
-function safeJsonParse(text: string): unknown | null {
+type StatusSnapshotRow = {
+  generated_at: number;
+  body_json: string;
+};
+
+type StatusSnapshotMetadataRow = {
+  generated_at: number;
+  updated_at?: number | null;
+};
+
+type ParsedJsonText = {
+  trimmed: string;
+  value: unknown;
+};
+
+type ValidatedStatusSnapshotJson = {
+  bodyJson: string;
+  data: PublicStatusResponse;
+};
+
+type StatusSnapshotCacheEntry = {
+  generatedAt: number;
+  updatedAt: number;
+  bodyJson: string;
+  data: PublicStatusResponse;
+};
+
+function parseJsonText(text: string): ParsedJsonText | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
   try {
-    return JSON.parse(trimmed) as unknown;
+    return {
+      trimmed,
+      value: JSON.parse(trimmed) as unknown,
+    };
   } catch {
     return null;
   }
@@ -27,19 +64,59 @@ function normalizeStatusSnapshotPayload(value: unknown): PublicStatusResponse | 
   return parsed.success ? parsed.data : null;
 }
 
-function normalizeStatusSnapshotBodyJson(bodyJson: string): string | null {
-  const parsed = safeJsonParse(bodyJson);
+function validateStatusSnapshotBodyJson(bodyJson: string): ValidatedStatusSnapshotJson | null {
+  const parsed = parseJsonText(bodyJson);
   if (parsed === null) {
     return null;
   }
 
-  const payload = normalizeStatusSnapshotPayload(parsed);
-  return payload ? JSON.stringify(payload) : null;
+  const payload = normalizeStatusSnapshotPayload(parsed.value);
+  return payload
+    ? {
+        bodyJson: parsed.trimmed,
+        data: payload,
+      }
+    : null;
+}
+
+function toSnapshotUpdatedAt(row: StatusSnapshotMetadataRow): number {
+  return typeof row.updated_at === 'number' && Number.isFinite(row.updated_at)
+    ? row.updated_at
+    : row.generated_at;
+}
+
+function readCachedStatusSnapshot(
+  db: D1Database,
+  generatedAt: number,
+  updatedAt: number,
+): StatusSnapshotCacheEntry | null {
+  const cached = normalizedStatusCacheByDb.get(db);
+  if (!cached) {
+    return null;
+  }
+
+  return cached.generatedAt === generatedAt && cached.updatedAt === updatedAt ? cached : null;
+}
+
+function writeCachedStatusSnapshot(
+  db: D1Database,
+  generatedAt: number,
+  updatedAt: number,
+  validated: ValidatedStatusSnapshotJson,
+): StatusSnapshotCacheEntry {
+  const cached: StatusSnapshotCacheEntry = {
+    generatedAt,
+    updatedAt,
+    bodyJson: validated.bodyJson,
+    data: validated.data,
+  };
+  normalizedStatusCacheByDb.set(db, cached);
+  return cached;
 }
 
 async function readStatusSnapshotRow(
   db: D1Database,
-): Promise<{ generated_at: number; body_json: string } | null> {
+): Promise<StatusSnapshotRow | null> {
   const cached = readStatusStatementByDb.get(db);
   const statement = cached ?? db.prepare(READ_STATUS_SQL);
   if (!cached) {
@@ -48,7 +125,21 @@ async function readStatusSnapshotRow(
 
   return await statement
     .bind(SNAPSHOT_KEY)
-    .first<{ generated_at: number; body_json: string }>();
+    .first<StatusSnapshotRow>();
+}
+
+async function readStatusSnapshotMetadataRow(
+  db: D1Database,
+): Promise<StatusSnapshotMetadataRow | null> {
+  const cached = readStatusMetadataStatementByDb.get(db);
+  const statement = cached ?? db.prepare(READ_STATUS_METADATA_SQL);
+  if (!cached) {
+    readStatusMetadataStatementByDb.set(db, statement);
+  }
+
+  return await statement
+    .bind(SNAPSHOT_KEY)
+    .first<StatusSnapshotMetadataRow>();
 }
 
 export async function readStatusSnapshotJson(
@@ -56,19 +147,31 @@ export async function readStatusSnapshotJson(
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
   try {
-    const row = await readStatusSnapshotRow(db);
-    if (!row) return null;
+    const metadata = await readStatusSnapshotMetadataRow(db);
+    if (!metadata) return null;
 
-    const age = Math.max(0, now - row.generated_at);
+    const age = Math.max(0, now - metadata.generated_at);
     if (age > MAX_AGE_SECONDS) return null;
 
-    const bodyJson = normalizeStatusSnapshotBodyJson(row.body_json);
-    if (bodyJson === null) {
+    const updatedAt = toSnapshotUpdatedAt(metadata);
+    const cached = readCachedStatusSnapshot(db, metadata.generated_at, updatedAt);
+    if (cached) {
+      return { bodyJson: cached.bodyJson, age };
+    }
+
+    const row = await readStatusSnapshotRow(db);
+    if (!row || row.generated_at !== metadata.generated_at) {
+      return null;
+    }
+
+    const validated = validateStatusSnapshotBodyJson(row.body_json);
+    if (validated === null) {
       console.warn('public snapshot: invalid JSON, falling back to live');
       return null;
     }
 
-    return { bodyJson, age };
+    const next = writeCachedStatusSnapshot(db, row.generated_at, updatedAt, validated);
+    return { bodyJson: next.bodyJson, age };
   } catch (err) {
     console.warn('public snapshot: read failed, falling back to live', err);
     return null;
@@ -81,16 +184,26 @@ export async function readStaleStatusSnapshotJson(
   maxStaleSeconds = MAX_STALE_SECONDS,
 ): Promise<{ bodyJson: string; age: number } | null> {
   try {
-    const row = await readStatusSnapshotRow(db);
-    if (!row) return null;
+    const metadata = await readStatusSnapshotMetadataRow(db);
+    if (!metadata) return null;
 
-    const age = Math.max(0, now - row.generated_at);
+    const age = Math.max(0, now - metadata.generated_at);
     if (age > maxStaleSeconds) return null;
 
-    const bodyJson = normalizeStatusSnapshotBodyJson(row.body_json);
-    if (bodyJson === null) return null;
+    const updatedAt = toSnapshotUpdatedAt(metadata);
+    const cached = readCachedStatusSnapshot(db, metadata.generated_at, updatedAt);
+    if (cached) {
+      return { bodyJson: cached.bodyJson, age };
+    }
 
-    return { bodyJson, age };
+    const row = await readStatusSnapshotRow(db);
+    if (!row || row.generated_at !== metadata.generated_at) return null;
+
+    const validated = validateStatusSnapshotBodyJson(row.body_json);
+    if (validated === null) return null;
+
+    const next = writeCachedStatusSnapshot(db, row.generated_at, updatedAt, validated);
+    return { bodyJson: next.bodyJson, age };
   } catch {
     return null;
   }

@@ -425,9 +425,12 @@ describe('public homepage route', () => {
     expect(dbReads).toEqual([
       'homepage:artifact',
       'homepage',
-      'homepage:artifact',
       'homepage',
       'homepage:artifact',
+      'homepage',
+      'homepage',
+      'homepage:artifact',
+      'homepage',
       'homepage',
     ]);
   });
@@ -454,7 +457,7 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(payload);
-    expect(dbReads).toEqual(['homepage:artifact', 'homepage']);
+    expect(dbReads).toEqual(['homepage:artifact', 'homepage', 'homepage']);
     expect(res.headers.get('Cache-Control')).toContain('max-age=0');
   });
 

@@ -455,7 +455,7 @@ describe('snapshots/public-homepage', () => {
     const artifactPayload = samplePayload(now - 60);
     const db = createFakeD1Database([
       {
-        match: 'select generated_at, body_json from public_snapshots',
+        match: 'from public_snapshots',
         first: (args) => {
           if (args[0] === 'homepage') {
             return {
@@ -487,7 +487,7 @@ describe('snapshots/public-homepage', () => {
     const render = buildHomepageRenderArtifact(payload);
     const db = createFakeD1Database([
       {
-        match: 'select generated_at, body_json from public_snapshots',
+        match: 'from public_snapshots',
         first: (args) =>
           args[0] === 'homepage:artifact'
             ? {
@@ -510,7 +510,7 @@ describe('snapshots/public-homepage', () => {
     const fresherPayload = samplePayload(now - 10);
     const db = createFakeD1Database([
       {
-        match: 'select generated_at, body_json from public_snapshots',
+        match: 'from public_snapshots',
         first: (args) => {
           if (args[0] === 'homepage:artifact') {
             return {
@@ -540,7 +540,7 @@ describe('snapshots/public-homepage', () => {
     const payload = samplePayload(now - 10);
     const db = createFakeD1Database([
       {
-        match: 'select generated_at, body_json from public_snapshots',
+        match: 'from public_snapshots',
         first: (args) => {
           if (args[0] === 'homepage:artifact') {
             return {
