@@ -695,89 +695,97 @@ export async function readHomepageRefreshBaseSnapshot(
   snapshot: PublicHomepageResponse | null;
   seedDataSnapshot: boolean;
 }> {
-  const candidates = listSnapshotCandidatesFromRefreshRows(await readRefreshSnapshotMetadataRows(db))
-    .filter((candidate) => !isFutureSnapshotCandidate(candidate, now))
-    .sort(comparePayloadCandidates);
-  const readRefreshCandidate = async (
-    candidateList: readonly SnapshotCandidate[],
-  ): Promise<{ row: ParsedSnapshotRow | null; invalid: boolean }> => {
-    let invalid = false;
+  let invalid = false;
 
-    for (const candidate of candidateList) {
-      const row = await readRefreshSnapshotRowByKey(db, candidate.key);
-      if (!row) {
-        continue;
-      }
-
-      const liveCandidate: SnapshotCandidate = {
-        key: candidate.key,
-        generatedAt: row.generated_at,
-        updatedAt: toSnapshotUpdatedAt(row),
-      };
-      if (isFutureSnapshotCandidate(liveCandidate, now)) {
-        invalid = true;
-        continue;
-      }
-
-      const dbCached = readCachedParsedSnapshotRow(
-        parsedHomepagePayloadCacheByDb,
-        db,
-        liveCandidate,
-        row.body_json,
-      );
-      if (dbCached) {
-        return { row: dbCached, invalid };
-      }
-
-      const globalCached = readCachedParsedSnapshotRowGlobal(
-        parsedHomepagePayloadCacheGlobal,
-        liveCandidate,
-        row.body_json,
-      );
-      if (globalCached) {
-        return {
-          row: writeCachedParsedSnapshotRow(
-            parsedHomepagePayloadCacheByDb,
-            db,
-            liveCandidate,
-            row.body_json,
-            globalCached.snapshot,
-          ),
-          invalid,
-        };
-      }
-
-      const snapshot = parseHomepagePayloadSnapshotForKey(liveCandidate.key, row.body_json);
-      if (!snapshot) {
-        invalid = true;
-        continue;
-      }
-
-      writeCachedParsedSnapshotRowGlobal(
-        parsedHomepagePayloadCacheGlobal,
-        liveCandidate,
-        row.body_json,
-        snapshot,
-      );
-
-      return {
-        row: writeCachedParsedSnapshotRow(
-          parsedHomepagePayloadCacheByDb,
-          db,
-          liveCandidate,
-          row.body_json,
-          snapshot,
-        ),
-        invalid,
-      };
+  const readRefreshCandidate = async (key: SnapshotKey): Promise<ParsedSnapshotRow | null> => {
+    const row = await readRefreshSnapshotRowByKey(db, key);
+    if (!row?.body_json) {
+      return null;
     }
 
-    return { row: null, invalid };
+    const candidate: SnapshotCandidate = {
+      key,
+      generatedAt: row.generated_at,
+      updatedAt: toSnapshotUpdatedAt(row),
+    };
+    if (isFutureSnapshotCandidate(candidate, now)) {
+      invalid = true;
+      return null;
+    }
+
+    const dbCached = readCachedParsedSnapshotRow(
+      parsedHomepagePayloadCacheByDb,
+      db,
+      candidate,
+      row.body_json,
+    );
+    if (dbCached) {
+      return dbCached;
+    }
+
+    const globalCached = readCachedParsedSnapshotRowGlobal(
+      parsedHomepagePayloadCacheGlobal,
+      candidate,
+      row.body_json,
+    );
+    if (globalCached) {
+      return writeCachedParsedSnapshotRow(
+        parsedHomepagePayloadCacheByDb,
+        db,
+        candidate,
+        row.body_json,
+        globalCached.snapshot,
+      );
+    }
+
+    const snapshot = parseHomepagePayloadSnapshotForKey(candidate.key, row.body_json);
+    if (!snapshot) {
+      invalid = true;
+      return null;
+    }
+
+    writeCachedParsedSnapshotRowGlobal(
+      parsedHomepagePayloadCacheGlobal,
+      candidate,
+      row.body_json,
+      snapshot,
+    );
+    return writeCachedParsedSnapshotRow(
+      parsedHomepagePayloadCacheByDb,
+      db,
+      candidate,
+      row.body_json,
+      snapshot,
+    );
   };
 
-  const { row: sameDayBase, invalid: sameDayInvalid } = await readRefreshCandidate(
-    candidates.filter((candidate) => isSameUtcDay(candidate.generatedAt, now)),
-  );
+  const [homepageBase, artifactBase] = await Promise.all([
+    readRefreshCandidate(SNAPSHOT_KEY),
+    readRefreshCandidate(SNAPSHOT_ARTIFACT_KEY),
+  ]);
+
+  let sameDayBase: ParsedSnapshotRow | null =
+    homepageBase && isSameUtcDay(homepageBase.generatedAt, now) ? homepageBase : null;
+  if (
+    artifactBase &&
+    isSameUtcDay(artifactBase.generatedAt, now) &&
+    (!sameDayBase ||
+      comparePayloadCandidates(
+        {
+          key: SNAPSHOT_ARTIFACT_KEY,
+          generatedAt: artifactBase.generatedAt,
+          updatedAt: artifactBase.updatedAt,
+        },
+        {
+          key: SNAPSHOT_KEY,
+          generatedAt: sameDayBase.generatedAt,
+          updatedAt: sameDayBase.updatedAt,
+        },
+      ) < 0)
+  ) {
+    sameDayBase = artifactBase;
+  }
+
   if (sameDayBase) {
     return {
       generatedAt: sameDayBase.generatedAt,
@@ -786,7 +794,26 @@ export async function readHomepageRefreshBaseSnapshot(
     };
   }
 
-  const { row: freshestBase, invalid: freshestInvalid } = await readRefreshCandidate(candidates);
+  let freshestBase: ParsedSnapshotRow | null = homepageBase;
+  if (
+    artifactBase &&
+    (!freshestBase ||
+      comparePayloadCandidates(
+        {
+          key: SNAPSHOT_ARTIFACT_KEY,
+          generatedAt: artifactBase.generatedAt,
+          updatedAt: artifactBase.updatedAt,
+        },
+        {
+          key: SNAPSHOT_KEY,
+          generatedAt: freshestBase.generatedAt,
+          updatedAt: freshestBase.updatedAt,
+        },
+      ) < 0)
+  ) {
+    freshestBase = artifactBase;
+  }
+
   if (freshestBase) {
     return {
       generatedAt: freshestBase.generatedAt,
@@ -795,15 +822,7 @@ export async function readHomepageRefreshBaseSnapshot(
     };
   }
 
-  if (candidates.length === 0) {
-    return {
-      generatedAt: null,
-      snapshot: null,
-      seedDataSnapshot: true,
-    };
-  }
-
-  if (sameDayInvalid || freshestInvalid) {
+  if (invalid) {
     console.warn('homepage snapshot: invalid refresh payload');
   }
 
