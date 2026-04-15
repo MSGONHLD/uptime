@@ -29,6 +29,7 @@ import type { NotifyContext } from './notifications';
 const LOCK_NAME = 'scheduler:tick';
 const LOCK_LEASE_SECONDS = 135;
 const INTERNAL_SCHEDULED_BATCH_SIZE = 6;
+const INTERNAL_SCHEDULED_BATCH_CONCURRENCY = 2;
 
 const CHECK_CONCURRENCY = 5;
 const D1_MAX_SQL_VARIABLES = 100;
@@ -110,6 +111,26 @@ function readScheduledTraceToken(env: Env): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function isTruthyEnvFlag(value: unknown): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === '1' ||
+    normalized === 'true' ||
+    normalized === 'yes' ||
+    normalized === 'on'
+  );
+}
+
+function shouldTraceScheduledRefresh(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return isTruthyEnvFlag(
+    rawEnv.UPTIMER_TRACE_SCHEDULED_REFRESH ?? rawEnv.TRACE_SCHEDULED_REFRESH,
+  );
+}
+
 async function refreshHomepageSnapshotViaService(
   env: Env,
   opts: {
@@ -124,19 +145,21 @@ async function refreshHomepageSnapshotViaService(
   }
 
   const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
-  const traceToken = readScheduledTraceToken(env);
   const headers: Record<string, string> = {
     Authorization: `Bearer ${env.ADMIN_TOKEN}`,
     'Content-Type': runtimeUpdates
       ? 'application/json; charset=utf-8'
       : 'text/plain; charset=utf-8',
     'X-Uptimer-Refresh-Source': 'scheduled',
-    'X-Uptimer-Trace': '1',
-    'X-Uptimer-Trace-Id': crypto.randomUUID(),
-    'X-Uptimer-Trace-Mode': 'scheduled',
   };
-  if (traceToken) {
-    headers['X-Uptimer-Trace-Token'] = traceToken;
+  if (shouldTraceScheduledRefresh(env)) {
+    headers['X-Uptimer-Trace'] = '1';
+    headers['X-Uptimer-Trace-Id'] = crypto.randomUUID();
+    headers['X-Uptimer-Trace-Mode'] = 'scheduled';
+    const traceToken = readScheduledTraceToken(env);
+    if (traceToken) {
+      headers['X-Uptimer-Trace-Token'] = traceToken;
+    }
   }
   const res = await env.SELF.fetch(
     new Request('http://internal/api/v1/internal/refresh/homepage', {
@@ -297,6 +320,7 @@ export type DueMonitorRow = {
   response_forbidden_keyword_mode: HttpResponseMatchMode | null;
   state_status: string | null;
   state_last_error: string | null;
+  last_checked_at: number | null;
   last_changed_at: number | null;
   consecutive_failures: number | null;
   consecutive_successes: number | null;
@@ -368,6 +392,7 @@ const LIST_DUE_MONITORS_SQL = `
     m.response_forbidden_keyword_mode,
     s.status AS state_status,
     s.last_error AS state_last_error,
+    s.last_checked_at,
     s.last_changed_at,
     s.consecutive_failures,
     s.consecutive_successes
@@ -504,6 +529,7 @@ export async function listMonitorRowsByIds(
         m.response_forbidden_keyword_mode,
         s.status AS state_status,
         s.last_error AS state_last_error,
+        s.last_checked_at,
         s.last_changed_at,
         s.consecutive_failures,
         s.consecutive_successes
@@ -1054,32 +1080,35 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
 
     if (serviceBatchRows) {
       const batchesStart = performance.now();
+      const batchLimit = pLimit(INTERNAL_SCHEDULED_BATCH_CONCURRENCY);
       const batchResults = await Promise.all(
-        serviceBatchRows.map(async (rows) => {
-          const ids = rows.map((row) => row.id);
-          const suppressedIds = ids.filter((id) => suppressedMonitorIds.has(id));
-          try {
-            return await runScheduledCheckBatchViaService(env, {
-              ids,
-              checkedAt,
-              suppressedMonitorIds: suppressedIds,
-              stateMachineConfig,
-              allowNotifications: Boolean(notificationsModule),
-            });
-          } catch (err) {
-            console.warn('scheduled: service batch failed, falling back inline', err);
-            return await runPersistedMonitorBatch({
-              db: env.DB,
-              rows,
-              checkedAt,
-              suppressedMonitorIds,
-              stateMachineConfig,
-              ...(inlineNotificationHandler
-                ? { onPersistedMonitor: inlineNotificationHandler }
-                : {}),
-            });
-          }
-        }),
+        serviceBatchRows.map((rows) =>
+          batchLimit(async () => {
+            const ids = rows.map((row) => row.id);
+            const suppressedIds = ids.filter((id) => suppressedMonitorIds.has(id));
+            try {
+              return await runScheduledCheckBatchViaService(env, {
+                ids,
+                checkedAt,
+                suppressedMonitorIds: suppressedIds,
+                stateMachineConfig,
+                allowNotifications: Boolean(notify),
+              });
+            } catch (err) {
+              console.warn('scheduled: service batch failed, falling back inline', err);
+              return await runPersistedMonitorBatch({
+                db: env.DB,
+                rows,
+                checkedAt,
+                suppressedMonitorIds,
+                stateMachineConfig,
+                ...(inlineNotificationHandler
+                  ? { onPersistedMonitor: inlineNotificationHandler }
+                  : {}),
+              });
+            }
+          }),
+        ),
       );
       batchWallDurMs = performance.now() - batchesStart;
 

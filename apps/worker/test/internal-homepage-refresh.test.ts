@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/scheduler/lock', () => ({
   acquireLease: vi.fn(),
+  releaseLease: vi.fn(),
 }));
 vi.mock('../src/public/homepage', () => ({
   computePublicHomepagePayload: vi.fn(),
@@ -18,7 +19,7 @@ import {
   computePublicHomepagePayload,
   tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates,
 } from '../src/public/homepage';
-import { acquireLease } from '../src/scheduler/lock';
+import { acquireLease, releaseLease } from '../src/scheduler/lock';
 import { toHomepageSnapshotPayload, writeHomepageSnapshot } from '../src/snapshots/public-homepage';
 import { createFakeD1Database } from './helpers/fake-d1';
 
@@ -126,6 +127,7 @@ describe('internal homepage refresh route', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.mocked(acquireLease).mockResolvedValue(true);
+    vi.mocked(releaseLease).mockResolvedValue(undefined);
   });
 
   it('uses the scheduled runtime fast path when available', async () => {
@@ -184,6 +186,7 @@ describe('internal homepage refresh route', () => {
     expect(computePublicHomepagePayload).not.toHaveBeenCalled();
     expect(toHomepageSnapshotPayload).toHaveBeenCalledWith(fastPayload);
     expect(writeHomepageSnapshot).toHaveBeenCalledWith(env.DB, now, fastPayload, undefined, false);
+    expect(releaseLease).toHaveBeenCalledWith(env.DB, 'snapshot:homepage:refresh', now + 55);
     expect(
       vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates),
     ).toHaveBeenCalledWith({
@@ -312,5 +315,6 @@ describe('internal homepage refresh route', () => {
       undefined,
       false,
     );
+    expect(releaseLease).toHaveBeenCalledWith(env.DB, 'snapshot:homepage:refresh', now + 55);
   });
 });

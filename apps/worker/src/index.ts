@@ -143,6 +143,15 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     trace.setLabel('skip_initial_freshness_check', '1');
   }
 
+  let claimedLeaseExpiresAt: number | null = null;
+  let releaseHomepageRefreshLease:
+    | ((
+        db: D1Database,
+        name: string,
+        expiresAt: number,
+      ) => Promise<void>)
+    | null = null;
+
   try {
     const { readHomepageRefreshBaseSnapshot, readHomepageSnapshotGeneratedAt } = trace
       ? await trace.timeAsync(
@@ -171,12 +180,13 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       }
     }
 
-    const { acquireLease } = trace
+    const { acquireLease, releaseLease } = trace
       ? await trace.timeAsync(
           'import_scheduler_lock_module',
           async () => await import('./scheduler/lock'),
         )
       : await import('./scheduler/lock');
+    releaseHomepageRefreshLease = releaseLease;
     const acquired = trace
       ? await trace.timeAsync(
           'homepage_refresh_lease',
@@ -205,6 +215,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         { refreshed: false },
       );
     }
+    claimedLeaseExpiresAt = now + HOMEPAGE_REFRESH_LOCK_LEASE_SECONDS;
 
     const baseSnapshot = trace
       ? await trace.timeAsync(
@@ -317,6 +328,16 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       traceMod,
       { error: true },
     );
+  } finally {
+    if (claimedLeaseExpiresAt !== null && releaseHomepageRefreshLease) {
+      await releaseHomepageRefreshLease(
+        env.DB,
+        HOMEPAGE_REFRESH_LOCK_NAME,
+        claimedLeaseExpiresAt,
+      ).catch((err) => {
+        console.warn('internal refresh: failed to release homepage lease', err);
+      });
+    }
   }
 }
 
@@ -364,7 +385,8 @@ async function handleInternalScheduledCheckBatch(
   const rowById = new Map(fetchedRows.map((row) => [row.id, row]));
   const rows = ids
     .map((id) => rowById.get(id) ?? null)
-    .filter((row): row is NonNullable<typeof row> => row !== null);
+    .filter((row): row is NonNullable<typeof row> => row !== null)
+    .filter((row) => row.last_checked_at === null || row.last_checked_at < parsedBody.data.checked_at);
 
   const notify = notificationsModule
     ? await notificationsModule.createNotifyContext(env, ctx)
