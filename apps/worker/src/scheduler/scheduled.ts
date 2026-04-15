@@ -100,6 +100,16 @@ type ScheduledCheckBatchServiceContext = {
   allowNotifications: boolean;
 };
 
+function readScheduledTraceToken(env: Env): string | null {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  const raw = rawEnv.UPTIMER_TRACE_TOKEN ?? rawEnv.TRACE_TOKEN;
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 async function refreshHomepageSnapshotViaService(
   env: Env,
   opts: {
@@ -114,16 +124,24 @@ async function refreshHomepageSnapshotViaService(
   }
 
   const runtimeUpdates = opts.runtimeUpdates?.length ? opts.runtimeUpdates : undefined;
+  const traceToken = readScheduledTraceToken(env);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+    'Content-Type': runtimeUpdates
+      ? 'application/json; charset=utf-8'
+      : 'text/plain; charset=utf-8',
+    'X-Uptimer-Refresh-Source': 'scheduled',
+    'X-Uptimer-Trace': '1',
+    'X-Uptimer-Trace-Id': crypto.randomUUID(),
+    'X-Uptimer-Trace-Mode': 'scheduled',
+  };
+  if (traceToken) {
+    headers['X-Uptimer-Trace-Token'] = traceToken;
+  }
   const res = await env.SELF.fetch(
     new Request('http://internal/api/v1/internal/refresh/homepage', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
-        'Content-Type': runtimeUpdates
-          ? 'application/json; charset=utf-8'
-          : 'text/plain; charset=utf-8',
-        'X-Uptimer-Refresh-Source': 'scheduled',
-      },
+      headers,
       body: runtimeUpdates
         ? JSON.stringify({
             token: env.ADMIN_TOKEN,
