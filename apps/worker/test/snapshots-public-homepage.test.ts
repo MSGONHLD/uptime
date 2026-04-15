@@ -187,6 +187,8 @@ describe('snapshots/public-homepage', () => {
     expect(bootstrapped.monitor_count_total).toBe(30);
     expect(bootstrapped.monitors).toHaveLength(30);
     expect(artifact.preload_html).toContain('Monitor 30');
+    expect(artifact.preload_html).toContain('<path d="M');
+    expect(artifact.preload_html).not.toContain('<rect ');
     expect(artifact.preload_html).not.toContain('#30');
     expect(artifact.preload_html).not.toContain('more services will appear after the app finishes loading');
   });

@@ -130,6 +130,36 @@ function heartbeatHeightPct(
   return 36 + Math.min(64, Math.max(0, latencyMs / 12));
 }
 
+type StripRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fill: string;
+};
+
+function buildStripSvgFromRects(rects: StripRect[], width: number, height: number): string {
+  const pathByFill = new Map<string, string[]>();
+
+  for (const rect of rects) {
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const command = `M${rect.x},${rect.y}h${rect.width}v${rect.height}H${rect.x}z`;
+    const existing = pathByFill.get(rect.fill);
+    if (existing) {
+      existing.push(command);
+      continue;
+    }
+    pathByFill.set(rect.fill, [command]);
+  }
+
+  const paths: string[] = [];
+  for (const [fill, commands] of pathByFill.entries()) {
+    paths.push(`<path d="${commands.join('')}" fill="${fill}"/>`);
+  }
+
+  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${paths.join('')}</svg>`;
+}
+
 function buildUptimeStripSvg(
   strip: PublicHomepageResponse['monitors'][number]['uptime_day_strip'],
 ): string {
@@ -143,15 +173,17 @@ function buildUptimeStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  const rects: string[] = [];
+  const rects: StripRect[] = [];
   for (let index = 0; index < count; index += 1) {
-    const x = index * (barWidth + gap);
-    const fill = uptimeFillFromMilli(strip.uptime_pct_milli[index]);
-    rects.push(
-      `<rect x="${x}" width="${barWidth}" height="${height}" rx="1" fill="${fill}"/>`,
-    );
+    rects.push({
+      x: index * (barWidth + gap),
+      y: 0,
+      width: barWidth,
+      height,
+      fill: uptimeFillFromMilli(strip.uptime_pct_milli[index]),
+    });
   }
-  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects.join('')}</svg>`;
+  return buildStripSvgFromRects(rects, width, height);
 }
 
 function buildHeartbeatStripSvg(
@@ -166,18 +198,20 @@ function buildHeartbeatStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  const rects: string[] = [];
+  const rects: StripRect[] = [];
   for (let index = 0; index < count; index += 1) {
-    const x = index * (barWidth + gap);
     const barHeight = Math.round(
       (height * heartbeatHeightPct(strip.status_codes[index], strip.latency_ms[index])) / 100,
     );
-    const y = height - barHeight;
-    rects.push(
-      `<rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="1" fill="${heartbeatFillFromCode(strip.status_codes[index])}"/>`,
-    );
+    rects.push({
+      x: index * (barWidth + gap),
+      y: height - barHeight,
+      width: barWidth,
+      height: barHeight,
+      fill: heartbeatFillFromCode(strip.status_codes[index]),
+    });
   }
-  return `<svg class="usv" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">${rects.join('')}</svg>`;
+  return buildStripSvgFromRects(rects, width, height);
 }
 
 function renderIncidentCard(
