@@ -200,19 +200,22 @@ async function refreshHomepageSnapshotViaService(
     'homepage refresh service',
   );
 
+  const bodyText = await res.text().catch(() => '');
   if (!res.ok) {
-    const bodyText = await res.text().catch(() => '');
     throw new Error(`service refresh failed: HTTP ${res.status} ${bodyText}`.trim());
   }
-
-  try {
-    await res.body?.cancel();
-  } catch {
-    // Ignore best-effort body cancellation failures on service bindings.
+  let refreshed: boolean | null = null;
+  if (bodyText) {
+    try {
+      const parsed = JSON.parse(bodyText) as { refreshed?: unknown };
+      refreshed = typeof parsed.refreshed === 'boolean' ? parsed.refreshed : null;
+    } catch {
+      refreshed = null;
+    }
   }
 
   return {
-    refreshed: null,
+    refreshed,
   };
 }
 
