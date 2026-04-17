@@ -32,6 +32,7 @@ import {
   monitorVisibilityPredicate,
   shouldIncludeStatusPageScopedItem,
 } from '../public/visibility';
+import { Trace, applyTraceToResponse, resolveTraceOptions } from '../observability/trace';
 
 function isAuthorizedStatusAdminRequest(c: {
   env: Pick<Env, 'ADMIN_TOKEN'>;
@@ -54,6 +55,18 @@ function applyPrivateNoStore(res: Response): Response {
 
 function withVisibilityAwareCaching(res: Response, includeHiddenMonitors: boolean): Response {
   return includeHiddenMonitors ? applyPrivateNoStore(res) : res;
+}
+
+function createTrace(c: {
+  env: Env;
+  req: { header(name: string): string | undefined };
+}): Trace {
+  return new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
 }
 
 const latencyRangeSchema = z.enum(['24h']);
@@ -1035,59 +1048,70 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
   const id = z.coerce.number().int().positive().parse(c.req.param('id'));
   const dayStartAt = z.coerce.number().int().nonnegative().parse(c.req.query('day_start_at'));
   const dayEndAt = dayStartAt + 86400;
+  const trace = createTrace(c);
+  trace.setLabel('route', 'public/day-context');
+  trace.setLabel('monitor_id', id);
 
-  const monitor = await c.env.DB
-    .prepare(
-      `
-        SELECT id
-        FROM monitors
-        WHERE id = ?1 AND is_active = 1
-          AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
-      `,
-    )
-    .bind(id)
-    .first<{ id: number }>();
+  const monitor = await trace.timeAsync(
+    'monitor_lookup',
+    async () =>
+      await c.env.DB
+        .prepare(
+          `
+            SELECT id
+            FROM monitors
+            WHERE id = ?1 AND is_active = 1
+              AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
+          `,
+        )
+        .bind(id)
+        .first<{ id: number }>(),
+  );
   if (!monitor) {
     throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
   }
 
-  const [{ results: maintenanceRows }, { results: incidentRows }] = await Promise.all([
-    c.env.DB
-      .prepare(
-        `
-          SELECT mw.id, mw.title, mw.message, mw.starts_at, mw.ends_at, mw.created_at
-          FROM maintenance_windows mw
-          JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
-          WHERE mwm.monitor_id = ?1
-            AND mw.starts_at < ?3
-            AND mw.ends_at > ?2
-          ORDER BY mw.starts_at ASC, mw.id ASC
-          LIMIT 50
-        `,
-      )
-      .bind(id, dayStartAt, dayEndAt)
-      .all<MaintenanceWindowRow>(),
-    c.env.DB
-      .prepare(
-        `
-          SELECT i.id, i.title, i.status, i.impact, i.message, i.started_at, i.resolved_at
-          FROM incidents i
-          JOIN incident_monitors im ON im.incident_id = i.id
-          WHERE im.monitor_id = ?1
-            AND i.started_at < ?3
-            AND (i.resolved_at IS NULL OR i.resolved_at > ?2)
-          ORDER BY i.started_at ASC, i.id ASC
-          LIMIT 50
-        `,
-      )
-      .bind(id, dayStartAt, dayEndAt)
-      .all<IncidentRow>(),
-  ]);
+  const [{ results: maintenanceRows }, { results: incidentRows }] = await trace.timeAsync(
+    'primary_queries',
+    async () =>
+      await Promise.all([
+        c.env.DB
+          .prepare(
+            `
+              SELECT mw.id, mw.title, mw.message, mw.starts_at, mw.ends_at, mw.created_at
+              FROM maintenance_windows mw
+              JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
+              WHERE mwm.monitor_id = ?1
+                AND mw.starts_at < ?3
+                AND mw.ends_at > ?2
+              ORDER BY mw.starts_at ASC, mw.id ASC
+              LIMIT 50
+            `,
+          )
+          .bind(id, dayStartAt, dayEndAt)
+          .all<MaintenanceWindowRow>(),
+        c.env.DB
+          .prepare(
+            `
+              SELECT i.id, i.title, i.status, i.impact, i.message, i.started_at, i.resolved_at
+              FROM incidents i
+              JOIN incident_monitors im ON im.incident_id = i.id
+              WHERE im.monitor_id = ?1
+                AND i.started_at < ?3
+                AND (i.resolved_at IS NULL OR i.resolved_at > ?2)
+              ORDER BY i.started_at ASC, i.id ASC
+              LIMIT 50
+            `,
+          )
+          .bind(id, dayStartAt, dayEndAt)
+          .all<IncidentRow>(),
+      ]),
+  );
 
   const maintenance = maintenanceRows ?? [];
   const incidents = incidentRows ?? [];
   if (maintenance.length === 0 && incidents.length === 0) {
-    return withVisibilityAwareCaching(
+    const res = withVisibilityAwareCaching(
       c.json({
         day_start_at: dayStartAt,
         day_end_at: dayEndAt,
@@ -1096,39 +1120,46 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
       }),
       includeHiddenMonitors,
     );
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
+    return res;
   }
 
-  const [monitorIdsByWindowId, updatesByIncidentId, monitorIdsByIncidentId] = await Promise.all([
-    maintenance.length > 0
-      ? listMaintenanceWindowMonitorIdsByWindowId(
-          c.env.DB,
-          maintenance.map((row) => row.id),
-        )
-      : Promise.resolve(new Map<number, number[]>()),
-    incidents.length > 0
-      ? listIncidentUpdatesByIncidentId(
-          c.env.DB,
-          incidents.map((row) => row.id),
-        )
-      : Promise.resolve(new Map<number, IncidentUpdateRow[]>()),
-    incidents.length > 0
-      ? listIncidentMonitorIdsByIncidentId(
-          c.env.DB,
-          incidents.map((row) => row.id),
-        )
-      : Promise.resolve(new Map<number, number[]>()),
-  ]);
+  const [monitorIdsByWindowId, updatesByIncidentId, monitorIdsByIncidentId] = await trace.timeAsync(
+    'expansion_queries',
+    async () =>
+      await Promise.all([
+        maintenance.length > 0
+          ? listMaintenanceWindowMonitorIdsByWindowId(
+              c.env.DB,
+              maintenance.map((row) => row.id),
+            )
+          : Promise.resolve(new Map<number, number[]>()),
+        incidents.length > 0
+          ? listIncidentUpdatesByIncidentId(
+              c.env.DB,
+              incidents.map((row) => row.id),
+            )
+          : Promise.resolve(new Map<number, IncidentUpdateRow[]>()),
+        incidents.length > 0
+          ? listIncidentMonitorIdsByIncidentId(
+              c.env.DB,
+              incidents.map((row) => row.id),
+            )
+          : Promise.resolve(new Map<number, number[]>()),
+      ]),
+  );
 
   const visibleMonitorIds = includeHiddenMonitors
     ? new Set<number>()
-    : await (async () => {
+    : await trace.timeAsync('visibility_query', async () => {
         const scopedMonitorIds = [...monitorIdsByWindowId.values(), ...monitorIdsByIncidentId.values()].flat();
         return scopedMonitorIds.length === 0
           ? new Set<number>()
           : listStatusPageVisibleMonitorIds(c.env.DB, scopedMonitorIds);
-      })();
+      });
 
-  return withVisibilityAwareCaching(
+  const res = withVisibilityAwareCaching(
     c.json({
       day_start_at: dayStartAt,
       day_end_at: dayEndAt,
@@ -1159,6 +1190,9 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
     }),
     includeHiddenMonitors,
   );
+  trace.finish('total');
+  applyTraceToResponse({ res, trace, prefix: 'w' });
+  return res;
 });
 
 publicUiRoutes.get('/monitors/:id/outages', async (c) => {
@@ -1298,32 +1332,44 @@ publicUiRoutes.get('/monitors/:id/latency', async (c) => {
 publicUiRoutes.get('/analytics/uptime', async (c) => {
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
   const range = uptimeOverviewRangeSchema.optional().default('30d').parse(c.req.query('range'));
+  const trace = createTrace(c);
+  trace.setLabel('route', 'public/analytics-uptime');
+  trace.setLabel('range', range);
 
   const now = Math.floor(Date.now() / 1000);
   const rangeEnd = Math.floor(now / 60) * 60;
   const rangeEndFullDays = utcDayStart(rangeEnd);
   const rangeStart = rangeEnd - (range === '30d' ? 30 * 86400 : 90 * 86400);
 
-  const { results: monitorRows } = await c.env.DB
-    .prepare(
-      `
-        SELECT m.id, m.name, m.type
-        FROM monitors m
-        WHERE m.is_active = 1
-          AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-        ORDER BY m.id
-      `,
-    )
-    .all<{
-      id: number;
-      name: string;
-      type: string;
-    }>();
+  const { results: monitorRows } = await trace.timeAsync(
+    'monitor_list',
+    async () =>
+      await c.env.DB
+        .prepare(
+          `
+            SELECT m.id, m.name, m.type
+            FROM monitors m
+            WHERE m.is_active = 1
+              AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+            ORDER BY m.id
+          `,
+        )
+        .all<{
+          id: number;
+          name: string;
+          type: string;
+        }>(),
+  );
 
   const monitors = monitorRows ?? [];
   const monitorIds = monitors.map((monitor) => monitor.id);
   const runtimeSnapshot =
-    monitorIds.length > 0 ? await readPublicMonitorRuntimeSnapshot(c.env.DB, rangeEnd) : null;
+    monitorIds.length > 0
+      ? await trace.timeAsync(
+          'runtime_snapshot',
+          async () => await readPublicMonitorRuntimeSnapshot(c.env.DB, rangeEnd),
+        )
+      : null;
   if (monitorIds.length > 0 && (!runtimeSnapshot || !snapshotHasMonitorIds(runtimeSnapshot, monitorIds))) {
     const { publicRoutes } = await import('./public');
     return publicRoutes.fetch(c.req.raw, c.env, c.executionCtx);
@@ -1333,42 +1379,44 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
     number,
     { total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }
   >();
-  for (const ids of chunkPositiveIntegerIds(monitorIds, 90)) {
-    const placeholders = buildNumberedPlaceholders(ids.length, 3);
-    const { results: sumRows } = await c.env.DB
-      .prepare(
-        `
-          SELECT
-            monitor_id,
-            SUM(total_sec) AS total_sec,
-            SUM(downtime_sec) AS downtime_sec,
-            SUM(unknown_sec) AS unknown_sec,
-            SUM(uptime_sec) AS uptime_sec
-          FROM monitor_daily_rollups
-          WHERE day_start_at >= ?1
-            AND day_start_at < ?2
-            AND monitor_id IN (${placeholders})
-          GROUP BY monitor_id
-        `,
-      )
-      .bind(rangeStart, rangeEndFullDays, ...ids)
-      .all<{
-        monitor_id: number;
-        total_sec: number;
-        downtime_sec: number;
-        unknown_sec: number;
-        uptime_sec: number;
-      }>();
+  await trace.timeAsync('rollup_queries', async () => {
+    for (const ids of chunkPositiveIntegerIds(monitorIds, 90)) {
+      const placeholders = buildNumberedPlaceholders(ids.length, 3);
+      const { results: sumRows } = await c.env.DB
+        .prepare(
+          `
+            SELECT
+              monitor_id,
+              SUM(total_sec) AS total_sec,
+              SUM(downtime_sec) AS downtime_sec,
+              SUM(unknown_sec) AS unknown_sec,
+              SUM(uptime_sec) AS uptime_sec
+            FROM monitor_daily_rollups
+            WHERE day_start_at >= ?1
+              AND day_start_at < ?2
+              AND monitor_id IN (${placeholders})
+            GROUP BY monitor_id
+          `,
+        )
+        .bind(rangeStart, rangeEndFullDays, ...ids)
+        .all<{
+          monitor_id: number;
+          total_sec: number;
+          downtime_sec: number;
+          unknown_sec: number;
+          uptime_sec: number;
+        }>();
 
-    for (const row of sumRows ?? []) {
-      rollupByMonitorId.set(row.monitor_id, {
-        total_sec: row.total_sec ?? 0,
-        downtime_sec: row.downtime_sec ?? 0,
-        unknown_sec: row.unknown_sec ?? 0,
-        uptime_sec: row.uptime_sec ?? 0,
-      });
+      for (const row of sumRows ?? []) {
+        rollupByMonitorId.set(row.monitor_id, {
+          total_sec: row.total_sec ?? 0,
+          downtime_sec: row.downtime_sec ?? 0,
+          unknown_sec: row.unknown_sec ?? 0,
+          uptime_sec: row.uptime_sec ?? 0,
+        });
+      }
     }
-  }
+  });
 
   const runtimeByMonitorId = runtimeSnapshot ? toMonitorRuntimeEntryMap(runtimeSnapshot) : null;
   let total_sec = 0;
@@ -1414,7 +1462,7 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
     };
   });
 
-  return withVisibilityAwareCaching(
+  const res = withVisibilityAwareCaching(
     c.json({
       generated_at: now,
       range,
@@ -1431,31 +1479,42 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
     }),
     includeHiddenMonitors,
   );
+  trace.finish('total');
+  applyTraceToResponse({ res, trace, prefix: 'w' });
+  return res;
 });
 
 publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
   const id = z.coerce.number().int().positive().parse(c.req.param('id'));
   const range = uptimeRangeSchema.optional().default('24h').parse(c.req.query('range'));
+  const trace = createTrace(c);
+  trace.setLabel('route', 'public/monitor-uptime');
+  trace.setLabel('monitor_id', id);
+  trace.setLabel('range', range);
 
-  const monitor = await c.env.DB
-    .prepare(
-      `
-        SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
-        FROM monitors m
-        LEFT JOIN monitor_state s ON s.monitor_id = m.id
-        WHERE m.id = ?1 AND m.is_active = 1
-          AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-      `,
-    )
-    .bind(id)
-    .first<{
-      id: number;
-      name: string;
-      interval_sec: number;
-      created_at: number;
-      last_checked_at: number | null;
-    }>();
+  const monitor = await trace.timeAsync(
+    'monitor_lookup',
+    async () =>
+      await c.env.DB
+        .prepare(
+          `
+            SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
+            FROM monitors m
+            LEFT JOIN monitor_state s ON s.monitor_id = m.id
+            WHERE m.id = ?1 AND m.is_active = 1
+              AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+          `,
+        )
+        .bind(id)
+        .first<{
+          id: number;
+          name: string;
+          interval_sec: number;
+          created_at: number;
+          last_checked_at: number | null;
+        }>(),
+  );
   if (!monitor) {
     throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
   }
@@ -1464,17 +1523,21 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
   const rangeEnd = Math.floor(now / 60) * 60;
   const requestedRangeStart = rangeEnd - rangeToSeconds(range);
   const rangeStart = Math.max(requestedRangeStart, monitor.created_at);
-  const effectiveRangeStart = await resolveUptimeRangeStartFromDb({
-    db: c.env.DB,
-    monitorId: id,
-    rangeStart,
-    rangeEnd,
-    monitorCreatedAt: monitor.created_at,
-    lastCheckedAt: monitor.last_checked_at,
-  });
+  const effectiveRangeStart = await trace.timeAsync(
+    'range_start',
+    async () =>
+      await resolveUptimeRangeStartFromDb({
+        db: c.env.DB,
+        monitorId: id,
+        rangeStart,
+        rangeEnd,
+        monitorCreatedAt: monitor.created_at,
+        lastCheckedAt: monitor.last_checked_at,
+      }),
+  );
   const rangeStartAt = effectiveRangeStart ?? rangeStart;
   if (effectiveRangeStart === null || rangeEnd <= effectiveRangeStart) {
-    return withVisibilityAwareCaching(
+    const res = withVisibilityAwareCaching(
       c.json({
         monitor: { id: monitor.id, name: monitor.name },
         range,
@@ -1488,6 +1551,9 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
       }),
       includeHiddenMonitors,
     );
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
+    return res;
   }
 
   const totals = {
@@ -1500,8 +1566,7 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
   const endDay = utcDayStart(rangeEnd);
 
   if (startDay === endDay) {
-    addUptimeTotals(
-      totals,
+    addUptimeTotals(totals, await trace.timeAsync('single_partial', async () =>
       await computePartialUptimeTotals(
         c.env.DB,
         monitor.id,
@@ -1511,12 +1576,11 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
         effectiveRangeStart,
         rangeEnd,
       ),
-    );
+    ));
   } else {
     const startPartialEnd = Math.min(rangeEnd, startDay + 86400);
     if (effectiveRangeStart < startPartialEnd) {
-      addUptimeTotals(
-        totals,
+      addUptimeTotals(totals, await trace.timeAsync('start_partial', async () =>
         await computePartialUptimeTotals(
           c.env.DB,
           monitor.id,
@@ -1526,33 +1590,37 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
           effectiveRangeStart,
           startPartialEnd,
         ),
-      );
+      ));
     }
 
     const fullDaysStart = Math.max(startDay + 86400, effectiveRangeStart);
     const fullDaysEnd = endDay;
     if (fullDaysStart < fullDaysEnd) {
-      const rollup = await c.env.DB
-        .prepare(
-          `
-            SELECT
-              SUM(total_sec) AS total_sec,
-              SUM(downtime_sec) AS downtime_sec,
-              SUM(unknown_sec) AS unknown_sec,
-              SUM(uptime_sec) AS uptime_sec
-            FROM monitor_daily_rollups
-            WHERE monitor_id = ?1
-              AND day_start_at >= ?2
-              AND day_start_at < ?3
-          `,
-        )
-        .bind(monitor.id, fullDaysStart, fullDaysEnd)
-        .first<{
-          total_sec: number | null;
-          downtime_sec: number | null;
-          unknown_sec: number | null;
-          uptime_sec: number | null;
-        }>();
+      const rollup = await trace.timeAsync(
+        'rollup_sum',
+        async () =>
+          await c.env.DB
+            .prepare(
+              `
+                SELECT
+                  SUM(total_sec) AS total_sec,
+                  SUM(downtime_sec) AS downtime_sec,
+                  SUM(unknown_sec) AS unknown_sec,
+                  SUM(uptime_sec) AS uptime_sec
+                FROM monitor_daily_rollups
+                WHERE monitor_id = ?1
+                  AND day_start_at >= ?2
+                  AND day_start_at < ?3
+              `,
+            )
+            .bind(monitor.id, fullDaysStart, fullDaysEnd)
+            .first<{
+              total_sec: number | null;
+              downtime_sec: number | null;
+              unknown_sec: number | null;
+              uptime_sec: number | null;
+            }>(),
+      );
 
       addUptimeTotals(totals, {
         total_sec: rollup?.total_sec ?? 0,
@@ -1563,17 +1631,20 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     }
 
     if (endDay < rangeEnd) {
-      const runtimeEntry = await readPublicMonitorRuntimeEntry({
-        db: c.env.DB,
-        now: rangeEnd,
-        monitorId: monitor.id,
-      });
+      const runtimeEntry = await trace.timeAsync(
+        'runtime_entry',
+        async () =>
+          await readPublicMonitorRuntimeEntry({
+            db: c.env.DB,
+            now: rangeEnd,
+            monitorId: monitor.id,
+          }),
+      );
 
       if (runtimeEntry) {
         addUptimeTotals(totals, materializeMonitorRuntimeTotals(runtimeEntry, rangeEnd));
       } else {
-        addUptimeTotals(
-          totals,
+        addUptimeTotals(totals, await trace.timeAsync('end_partial_fallback', async () =>
           await computePartialUptimeTotals(
             c.env.DB,
             monitor.id,
@@ -1583,12 +1654,12 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
             endDay,
             rangeEnd,
           ),
-        );
+        ));
       }
     }
   }
 
-  return withVisibilityAwareCaching(
+  const res = withVisibilityAwareCaching(
     c.json({
       monitor: { id: monitor.id, name: monitor.name },
       range,
@@ -1602,4 +1673,7 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     }),
     includeHiddenMonitors,
   );
+  trace.finish('total');
+  applyTraceToResponse({ res, trace, prefix: 'w' });
+  return res;
 });
