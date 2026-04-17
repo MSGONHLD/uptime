@@ -446,7 +446,210 @@ function addUptimeTotals(
   target.uptime_sec += source.uptime_sec;
 }
 
-async function computePartialUptimeTotals(
+async function computePartialUptimeTotalsSql(
+  db: D1Database,
+  monitorId: number,
+  intervalSec: number,
+  createdAt: number,
+  lastCheckedAt: number | null,
+  rangeStart: number,
+  rangeEnd: number,
+): Promise<{ total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }> {
+  if (rangeEnd <= rangeStart) {
+    return { total_sec: 0, downtime_sec: 0, unknown_sec: 0, uptime_sec: 0 };
+  }
+
+  const row = await db
+    .prepare(
+      `
+        WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+          VALUES (?3, ?4, ?5, ?6)
+        ),
+        first_checks AS (
+          SELECT monitor_id, MIN(checked_at) AS first_check_at
+          FROM check_results
+          WHERE monitor_id IN (SELECT monitor_id FROM input)
+            AND checked_at >= ?1
+            AND checked_at < ?2
+          GROUP BY monitor_id
+        ),
+        effective AS (
+          SELECT
+            i.monitor_id AS monitor_id,
+            i.interval_sec AS interval_sec,
+            CASE
+              WHEN i.created_at >= ?1 THEN
+                COALESCE(
+                  fc.first_check_at,
+                  CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
+                )
+              ELSE ?1
+            END AS start_at
+          FROM input i
+          LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+        ),
+        downtime_segments AS (
+          SELECT
+            o.monitor_id AS monitor_id,
+            max(o.started_at, e.start_at) AS seg_start,
+            min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+          FROM outages o
+          JOIN effective e ON e.monitor_id = o.monitor_id
+          WHERE e.start_at IS NOT NULL
+            AND o.started_at < ?2
+            AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+        ),
+        downtime AS (
+          SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+          FROM downtime_segments
+          GROUP BY monitor_id
+        ),
+        checks AS (
+          SELECT
+            cr.monitor_id AS monitor_id,
+            cr.checked_at AS checked_at,
+            cr.status AS status,
+            e.interval_sec AS interval_sec,
+            e.start_at AS start_at,
+            lag(cr.checked_at) OVER (
+              PARTITION BY cr.monitor_id
+              ORDER BY cr.checked_at
+            ) AS prev_at,
+            lag(cr.status) OVER (
+              PARTITION BY cr.monitor_id
+              ORDER BY cr.checked_at
+            ) AS prev_status
+          FROM check_results cr
+          JOIN effective e ON e.monitor_id = cr.monitor_id
+          WHERE e.start_at IS NOT NULL
+            AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+            AND cr.checked_at < ?2
+        ),
+        unknown_checks AS (
+          SELECT
+            monitor_id AS monitor_id,
+            CASE
+              WHEN prev_at IS NULL THEN start_at
+              WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+              ELSE max(
+                (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+                prev_at + interval_sec * 2
+              )
+            END AS seg_start,
+            checked_at AS seg_end
+          FROM checks
+          WHERE checked_at >= start_at
+        ),
+        last_any AS (
+          SELECT monitor_id, checked_at, status
+          FROM (
+            SELECT
+              monitor_id,
+              checked_at,
+              status,
+              row_number() OVER (
+                PARTITION BY monitor_id
+                ORDER BY checked_at DESC
+              ) AS rn
+            FROM checks
+          )
+          WHERE rn = 1
+        ),
+        last_in_range AS (
+          SELECT monitor_id, checked_at
+          FROM (
+            SELECT
+              monitor_id,
+              checked_at,
+              row_number() OVER (
+                PARTITION BY monitor_id
+                ORDER BY checked_at DESC
+              ) AS rn
+            FROM checks
+            WHERE checked_at >= start_at
+          )
+          WHERE rn = 1
+        ),
+        unknown_tail AS (
+          SELECT
+            e.monitor_id AS monitor_id,
+            CASE
+              WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+              WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+              ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+            END AS seg_start,
+            ?2 AS seg_end
+          FROM effective e
+          LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+          LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
+          WHERE e.start_at IS NOT NULL
+        ),
+        unknown_segments AS (
+          SELECT monitor_id, seg_start, seg_end
+          FROM unknown_checks
+          WHERE seg_end > seg_start
+          UNION ALL
+          SELECT monitor_id, seg_start, seg_end
+          FROM unknown_tail
+          WHERE seg_end > seg_start
+        ),
+        unknown_raw AS (
+          SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+          FROM unknown_segments
+          GROUP BY monitor_id
+        ),
+        unknown_overlap AS (
+          SELECT
+            u.monitor_id AS monitor_id,
+            sum(
+              max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+            ) AS overlap_sec
+          FROM unknown_segments u
+          JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+          WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+          GROUP BY u.monitor_id
+        )
+        SELECT
+          e.start_at AS start_at,
+          (?2 - e.start_at) AS total_sec,
+          coalesce(d.downtime_sec, 0) AS downtime_sec,
+          max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+        FROM effective e
+        LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+        LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+        LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+        WHERE e.start_at IS NOT NULL
+      `,
+    )
+    .bind(rangeStart, rangeEnd, monitorId, intervalSec, createdAt, lastCheckedAt)
+    .first<{
+      start_at: number | null;
+      total_sec: number | null;
+      downtime_sec: number | null;
+      unknown_sec: number | null;
+    }>();
+
+  if (row?.start_at === null || row?.start_at === undefined) {
+    return { total_sec: 0, downtime_sec: 0, unknown_sec: 0, uptime_sec: 0 };
+  }
+  if (
+    typeof row.total_sec !== 'number' ||
+    typeof row.downtime_sec !== 'number' ||
+    typeof row.unknown_sec !== 'number'
+  ) {
+    throw new Error('uptime partial sql returned invalid row');
+  }
+
+  const total_sec = Math.max(0, row.total_sec);
+  const downtime_sec = Math.max(0, row.downtime_sec);
+  const unknown_sec = Math.max(0, row.unknown_sec);
+  const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
+  const uptime_sec = Math.max(0, total_sec - unavailable_sec);
+
+  return { total_sec, downtime_sec, unknown_sec, uptime_sec };
+}
+
+async function computePartialUptimeTotalsLegacy(
   db: D1Database,
   monitorId: number,
   intervalSec: number,
@@ -533,6 +736,39 @@ async function computePartialUptimeTotals(
   const uptime_sec = Math.max(0, total_sec - unavailable_sec);
 
   return { total_sec, downtime_sec, unknown_sec, uptime_sec };
+}
+
+async function computePartialUptimeTotals(
+  db: D1Database,
+  monitorId: number,
+  intervalSec: number,
+  createdAt: number,
+  lastCheckedAt: number | null,
+  rangeStart: number,
+  rangeEnd: number,
+): Promise<{ total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }> {
+  try {
+    return await computePartialUptimeTotalsSql(
+      db,
+      monitorId,
+      intervalSec,
+      createdAt,
+      lastCheckedAt,
+      rangeStart,
+      rangeEnd,
+    );
+  } catch (err) {
+    console.warn('uptime: partial SQL failed, falling back to legacy', err);
+    return computePartialUptimeTotalsLegacy(
+      db,
+      monitorId,
+      intervalSec,
+      createdAt,
+      lastCheckedAt,
+      rangeStart,
+      rangeEnd,
+    );
+  }
 }
 
 async function readPublicMonitorRuntimeEntry(opts: {
