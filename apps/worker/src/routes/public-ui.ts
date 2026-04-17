@@ -18,7 +18,6 @@ import {
   MONITOR_RUNTIME_MAX_AGE_SECONDS,
   MONITOR_RUNTIME_SNAPSHOT_KEY,
   parsePublicMonitorRuntimeEntry,
-  type PublicMonitorRuntimeEntry,
   readPublicMonitorRuntimeSnapshot,
   snapshotHasMonitorIds,
   toMonitorRuntimeEntryMap,
@@ -376,6 +375,52 @@ function safeJsonParse(text: string): unknown | null {
   }
 }
 
+function takeBatchRows<T>(result: { results?: unknown[] | undefined } | null | undefined): T[] {
+  return Array.isArray(result?.results) ? (result.results as T[]) : [];
+}
+
+function takeBatchFirstRow<T>(
+  result: { results?: unknown[] | undefined } | null | undefined,
+): T | null {
+  const rows = takeBatchRows<T>(result);
+  return (rows[0] ?? null) as T | null;
+}
+
+function buildNumberMap<K extends number, T extends Record<string, unknown>>(
+  rows: T[],
+  key: keyof T,
+  valueBuilder?: (row: T) => number,
+): Map<K, number[]> {
+  const grouped = new Map<K, number[]>();
+
+  for (const row of rows) {
+    const groupKey = row[key];
+    if (typeof groupKey !== 'number' || !Number.isInteger(groupKey)) continue;
+    const existing = grouped.get(groupKey as K) ?? [];
+    existing.push(valueBuilder ? valueBuilder(row) : Number(row['monitor_id']));
+    grouped.set(groupKey as K, existing);
+  }
+
+  return grouped;
+}
+
+function buildRowArrayMap<K extends number, T extends Record<string, unknown>>(
+  rows: T[],
+  key: keyof T,
+): Map<K, T[]> {
+  const grouped = new Map<K, T[]>();
+
+  for (const row of rows) {
+    const groupKey = row[key];
+    if (typeof groupKey !== 'number' || !Number.isInteger(groupKey)) continue;
+    const existing = grouped.get(groupKey as K) ?? [];
+    existing.push(row);
+    grouped.set(groupKey as K, existing);
+  }
+
+  return grouped;
+}
+
 function toCheckStatus(value: string | null): 'up' | 'down' | 'maintenance' | 'unknown' {
   switch (value) {
     case 'up':
@@ -412,35 +457,19 @@ function resolveUptimeRangeStart(
   return monitorRangeStart;
 }
 
-async function resolveUptimeRangeStartFromDb(opts: {
-  db: D1Database;
-  monitorId: number;
+function resolveUptimeRangeStartFromFirstCheck(opts: {
   rangeStart: number;
   rangeEnd: number;
   monitorCreatedAt: number;
   lastCheckedAt: number | null;
-}): Promise<number | null> {
+  firstCheckAt: number | null;
+}): number | null {
   const monitorRangeStart = Math.max(opts.rangeStart, opts.monitorCreatedAt);
   if (opts.rangeEnd <= monitorRangeStart) return null;
 
   if (monitorRangeStart > opts.rangeStart) {
-    const firstCheck = await opts.db
-      .prepare(
-        `
-          SELECT checked_at
-          FROM check_results
-          WHERE monitor_id = ?1
-            AND checked_at >= ?2
-            AND checked_at < ?3
-          ORDER BY checked_at
-          LIMIT 1
-        `,
-      )
-      .bind(opts.monitorId, monitorRangeStart, opts.rangeEnd)
-      .first<{ checked_at: number }>();
-
-    if (typeof firstCheck?.checked_at === 'number') {
-      return firstCheck.checked_at;
+    if (typeof opts.firstCheckAt === 'number') {
+      return opts.firstCheckAt;
     }
 
     return opts.lastCheckedAt === null ? null : monitorRangeStart;
@@ -784,56 +813,6 @@ async function computePartialUptimeTotals(
   }
 }
 
-async function readPublicMonitorRuntimeEntry(opts: {
-  db: D1Database;
-  now: number;
-  monitorId: number;
-  maxAgeSeconds?: number;
-}): Promise<PublicMonitorRuntimeEntry | null> {
-  const row = await opts.db
-    .prepare(
-      `
-        SELECT
-          generated_at,
-          CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
-          (
-            SELECT entry.value
-            FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
-            WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
-            LIMIT 1
-          ) AS monitor_json
-        FROM public_snapshots
-        WHERE key = ?1
-      `,
-    )
-    .bind(MONITOR_RUNTIME_SNAPSHOT_KEY, opts.monitorId)
-    .first<{
-      generated_at: number;
-      day_start_at: number | null;
-      monitor_json: string | null;
-    }>();
-
-  if (!row || typeof row.generated_at !== 'number') {
-    return null;
-  }
-
-  const age = Math.max(0, opts.now - row.generated_at);
-  if (age > (opts.maxAgeSeconds ?? MONITOR_RUNTIME_MAX_AGE_SECONDS)) {
-    return null;
-  }
-
-  if (row.day_start_at !== utcDayStart(opts.now) || typeof row.monitor_json !== 'string') {
-    return null;
-  }
-
-  const parsed = safeJsonParse(row.monitor_json);
-  if (parsed === null) {
-    return null;
-  }
-
-  return parsePublicMonitorRuntimeEntry(parsed);
-}
-
 async function buildCompactLatencyResponseJson(opts: {
   db: D1Database;
   monitor: { id: number; name: string };
@@ -1052,29 +1031,20 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
   trace.setLabel('route', 'public/day-context');
   trace.setLabel('monitor_id', id);
 
-  const monitor = await trace.timeAsync(
-    'monitor_lookup',
-    async () =>
-      await c.env.DB
-        .prepare(
-          `
-            SELECT id
-            FROM monitors
-            WHERE id = ?1 AND is_active = 1
-              AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
-          `,
-        )
-        .bind(id)
-        .first<{ id: number }>(),
-  );
-  if (!monitor) {
-    throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
-  }
-
-  const [{ results: maintenanceRows }, { results: incidentRows }] = await trace.timeAsync(
+  const [monitorResult, maintenanceResult, incidentResult] = await trace.timeAsync(
     'primary_queries',
     async () =>
-      await Promise.all([
+      await c.env.DB.batch([
+        c.env.DB
+          .prepare(
+            `
+              SELECT id
+              FROM monitors
+              WHERE id = ?1 AND is_active = 1
+                AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
+            `,
+          )
+          .bind(id),
         c.env.DB
           .prepare(
             `
@@ -1088,8 +1058,7 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
               LIMIT 50
             `,
           )
-          .bind(id, dayStartAt, dayEndAt)
-          .all<MaintenanceWindowRow>(),
+          .bind(id, dayStartAt, dayEndAt),
         c.env.DB
           .prepare(
             `
@@ -1103,13 +1072,15 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
               LIMIT 50
             `,
           )
-          .bind(id, dayStartAt, dayEndAt)
-          .all<IncidentRow>(),
+          .bind(id, dayStartAt, dayEndAt),
       ]),
   );
-
-  const maintenance = maintenanceRows ?? [];
-  const incidents = incidentRows ?? [];
+  const monitor = takeBatchFirstRow<{ id: number }>(monitorResult);
+  if (!monitor) {
+    throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
+  }
+  const maintenance = takeBatchRows<MaintenanceWindowRow>(maintenanceResult);
+  const incidents = takeBatchRows<IncidentRow>(incidentResult);
   if (maintenance.length === 0 && incidents.length === 0) {
     const res = withVisibilityAwareCaching(
       c.json({
@@ -1125,30 +1096,94 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
     return res;
   }
 
-  const [monitorIdsByWindowId, updatesByIncidentId, monitorIdsByIncidentId] = await trace.timeAsync(
-    'expansion_queries',
-    async () =>
-      await Promise.all([
-        maintenance.length > 0
-          ? listMaintenanceWindowMonitorIdsByWindowId(
-              c.env.DB,
-              maintenance.map((row) => row.id),
-            )
-          : Promise.resolve(new Map<number, number[]>()),
-        incidents.length > 0
-          ? listIncidentUpdatesByIncidentId(
-              c.env.DB,
-              incidents.map((row) => row.id),
-            )
-          : Promise.resolve(new Map<number, IncidentUpdateRow[]>()),
-        incidents.length > 0
-          ? listIncidentMonitorIdsByIncidentId(
-              c.env.DB,
-              incidents.map((row) => row.id),
-            )
-          : Promise.resolve(new Map<number, number[]>()),
-      ]),
-  );
+  const maintenanceIds = maintenance.map((row) => row.id);
+  const incidentIds = incidents.map((row) => row.id);
+  const expansionStatements: D1PreparedStatement[] = [];
+  const expansionIndexes = {
+    windowMonitorIds: -1,
+    incidentUpdates: -1,
+    incidentMonitorIds: -1,
+  };
+
+  if (maintenanceIds.length > 0) {
+    expansionIndexes.windowMonitorIds = expansionStatements.length;
+    const placeholders = buildNumberedPlaceholders(maintenanceIds.length);
+    expansionStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            SELECT maintenance_window_id, monitor_id
+            FROM maintenance_window_monitors
+            WHERE maintenance_window_id IN (${placeholders})
+            ORDER BY maintenance_window_id, monitor_id
+          `,
+        )
+        .bind(...maintenanceIds),
+    );
+  }
+
+  if (incidentIds.length > 0) {
+    const placeholders = buildNumberedPlaceholders(incidentIds.length);
+    expansionIndexes.incidentUpdates = expansionStatements.length;
+    expansionStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            SELECT id, incident_id, status, message, created_at
+            FROM incident_updates
+            WHERE incident_id IN (${placeholders})
+            ORDER BY incident_id, created_at, id
+          `,
+        )
+        .bind(...incidentIds),
+    );
+
+    expansionIndexes.incidentMonitorIds = expansionStatements.length;
+    expansionStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            SELECT incident_id, monitor_id
+            FROM incident_monitors
+            WHERE incident_id IN (${placeholders})
+            ORDER BY incident_id, monitor_id
+          `,
+        )
+        .bind(...incidentIds),
+    );
+  }
+
+  const expansionResults =
+    expansionStatements.length === 0
+      ? []
+      : await trace.timeAsync('expansion_queries', async () => await c.env.DB.batch(expansionStatements));
+  const monitorIdsByWindowId =
+    expansionIndexes.windowMonitorIds === -1
+      ? new Map<number, number[]>()
+      : buildNumberMap<number, MaintenanceWindowMonitorLinkRow>(
+          takeBatchRows<MaintenanceWindowMonitorLinkRow>(
+            expansionResults[expansionIndexes.windowMonitorIds],
+          ),
+          'maintenance_window_id',
+          (row) => row.monitor_id,
+        );
+  const updatesByIncidentId =
+    expansionIndexes.incidentUpdates === -1
+      ? new Map<number, IncidentUpdateRow[]>()
+      : buildRowArrayMap<number, IncidentUpdateRow>(
+          takeBatchRows<IncidentUpdateRow>(expansionResults[expansionIndexes.incidentUpdates]),
+          'incident_id',
+        );
+  const monitorIdsByIncidentId =
+    expansionIndexes.incidentMonitorIds === -1
+      ? new Map<number, number[]>()
+      : buildNumberMap<number, IncidentMonitorLinkRow>(
+          takeBatchRows<IncidentMonitorLinkRow>(
+            expansionResults[expansionIndexes.incidentMonitorIds],
+          ),
+          'incident_id',
+          (row) => row.monitor_id,
+        );
 
   const visibleMonitorIds = includeHiddenMonitors
     ? new Set<number>()
@@ -1342,22 +1377,39 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
   const rangeStart = rangeEnd - (range === '30d' ? 30 * 86400 : 90 * 86400);
 
   const { results: monitorRows } = await trace.timeAsync(
-    'monitor_list',
+    'monitor_rollups',
     async () =>
       await c.env.DB
         .prepare(
           `
-            SELECT m.id, m.name, m.type
+            SELECT
+              m.id,
+              m.name,
+              m.type,
+              COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
+              COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
+              COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
+              COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
             FROM monitors m
+            LEFT JOIN monitor_daily_rollups r
+              ON r.monitor_id = m.id
+             AND r.day_start_at >= ?1
+             AND r.day_start_at < ?2
             WHERE m.is_active = 1
               AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+            GROUP BY m.id, m.name, m.type
             ORDER BY m.id
           `,
         )
+        .bind(rangeStart, rangeEndFullDays)
         .all<{
           id: number;
           name: string;
           type: string;
+          rollup_total_sec: number | null;
+          rollup_downtime_sec: number | null;
+          rollup_unknown_sec: number | null;
+          rollup_uptime_sec: number | null;
         }>(),
   );
 
@@ -1375,49 +1427,6 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
     return publicRoutes.fetch(c.req.raw, c.env, c.executionCtx);
   }
 
-  const rollupByMonitorId = new Map<
-    number,
-    { total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }
-  >();
-  await trace.timeAsync('rollup_queries', async () => {
-    for (const ids of chunkPositiveIntegerIds(monitorIds, 90)) {
-      const placeholders = buildNumberedPlaceholders(ids.length, 3);
-      const { results: sumRows } = await c.env.DB
-        .prepare(
-          `
-            SELECT
-              monitor_id,
-              SUM(total_sec) AS total_sec,
-              SUM(downtime_sec) AS downtime_sec,
-              SUM(unknown_sec) AS unknown_sec,
-              SUM(uptime_sec) AS uptime_sec
-            FROM monitor_daily_rollups
-            WHERE day_start_at >= ?1
-              AND day_start_at < ?2
-              AND monitor_id IN (${placeholders})
-            GROUP BY monitor_id
-          `,
-        )
-        .bind(rangeStart, rangeEndFullDays, ...ids)
-        .all<{
-          monitor_id: number;
-          total_sec: number;
-          downtime_sec: number;
-          unknown_sec: number;
-          uptime_sec: number;
-        }>();
-
-      for (const row of sumRows ?? []) {
-        rollupByMonitorId.set(row.monitor_id, {
-          total_sec: row.total_sec ?? 0,
-          downtime_sec: row.downtime_sec ?? 0,
-          unknown_sec: row.unknown_sec ?? 0,
-          uptime_sec: row.uptime_sec ?? 0,
-        });
-      }
-    }
-  });
-
   const runtimeByMonitorId = runtimeSnapshot ? toMonitorRuntimeEntryMap(runtimeSnapshot) : null;
   let total_sec = 0;
   let downtime_sec = 0;
@@ -1427,11 +1436,11 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
   const partialStart = rangeEndFullDays;
   const partialEnd = rangeEnd;
   const output = monitors.map((monitor) => {
-    const rollupTotals = rollupByMonitorId.get(monitor.id) ?? {
-      total_sec: 0,
-      downtime_sec: 0,
-      unknown_sec: 0,
-      uptime_sec: 0,
+    const rollupTotals = {
+      total_sec: monitor.rollup_total_sec ?? 0,
+      downtime_sec: monitor.rollup_downtime_sec ?? 0,
+      unknown_sec: monitor.rollup_unknown_sec ?? 0,
+      uptime_sec: monitor.rollup_uptime_sec ?? 0,
     };
     const partialTotals =
       partialEnd > partialStart && runtimeByMonitorId
@@ -1523,18 +1532,435 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
   const rangeEnd = Math.floor(now / 60) * 60;
   const requestedRangeStart = rangeEnd - rangeToSeconds(range);
   const rangeStart = Math.max(requestedRangeStart, monitor.created_at);
-  const effectiveRangeStart = await trace.timeAsync(
-    'range_start',
-    async () =>
-      await resolveUptimeRangeStartFromDb({
-        db: c.env.DB,
-        monitorId: id,
-        rangeStart,
-        rangeEnd,
-        monitorCreatedAt: monitor.created_at,
-        lastCheckedAt: monitor.last_checked_at,
-      }),
-  );
+  const startDay = utcDayStart(rangeStart);
+  const endDay = utcDayStart(rangeEnd);
+  const windowBatchStatements: D1PreparedStatement[] = [];
+  const windowIndexes = {
+    firstCheck: -1,
+    startPartial: -1,
+    singlePartial: -1,
+    rollup: -1,
+    runtime: -1,
+  };
+
+  if (monitor.created_at > rangeStart) {
+    windowIndexes.firstCheck = windowBatchStatements.length;
+    windowBatchStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            SELECT checked_at
+            FROM check_results
+            WHERE monitor_id = ?1
+              AND checked_at >= ?2
+              AND checked_at < ?3
+            ORDER BY checked_at
+            LIMIT 1
+          `,
+        )
+        .bind(monitor.id, monitor.created_at, rangeEnd),
+    );
+  }
+
+  if (startDay === endDay) {
+    windowIndexes.singlePartial = windowBatchStatements.length;
+    windowBatchStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+              VALUES (?3, ?4, ?5, ?6)
+            ),
+            first_checks AS (
+              SELECT monitor_id, MIN(checked_at) AS first_check_at
+              FROM check_results
+              WHERE monitor_id IN (SELECT monitor_id FROM input)
+                AND checked_at >= ?1
+                AND checked_at < ?2
+              GROUP BY monitor_id
+            ),
+            effective AS (
+              SELECT
+                i.monitor_id AS monitor_id,
+                i.interval_sec AS interval_sec,
+                CASE
+                  WHEN i.created_at >= ?1 THEN
+                    COALESCE(
+                      fc.first_check_at,
+                      CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
+                    )
+                  ELSE ?1
+                END AS start_at
+              FROM input i
+              LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+            ),
+            downtime_segments AS (
+              SELECT
+                o.monitor_id AS monitor_id,
+                max(o.started_at, e.start_at) AS seg_start,
+                min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+              FROM outages o
+              JOIN effective e ON e.monitor_id = o.monitor_id
+              WHERE e.start_at IS NOT NULL
+                AND o.started_at < ?2
+                AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+            ),
+            downtime AS (
+              SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+              FROM downtime_segments
+              GROUP BY monitor_id
+            ),
+            checks AS (
+              SELECT
+                cr.monitor_id AS monitor_id,
+                cr.checked_at AS checked_at,
+                cr.status AS status,
+                e.interval_sec AS interval_sec,
+                e.start_at AS start_at,
+                lag(cr.checked_at) OVER (
+                  PARTITION BY cr.monitor_id
+                  ORDER BY cr.checked_at
+                ) AS prev_at,
+                lag(cr.status) OVER (
+                  PARTITION BY cr.monitor_id
+                  ORDER BY cr.checked_at
+                ) AS prev_status
+              FROM check_results cr
+              JOIN effective e ON e.monitor_id = cr.monitor_id
+              WHERE e.start_at IS NOT NULL
+                AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+                AND cr.checked_at < ?2
+            ),
+            unknown_checks AS (
+              SELECT
+                monitor_id AS monitor_id,
+                CASE
+                  WHEN prev_at IS NULL THEN start_at
+                  WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+                  ELSE max(
+                    (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+                    prev_at + interval_sec * 2
+                  )
+                END AS seg_start,
+                checked_at AS seg_end
+              FROM checks
+              WHERE checked_at >= start_at
+            ),
+            last_any AS (
+              SELECT monitor_id, checked_at, status
+              FROM (
+                SELECT
+                  monitor_id,
+                  checked_at,
+                  status,
+                  row_number() OVER (
+                    PARTITION BY monitor_id
+                    ORDER BY checked_at DESC
+                  ) AS rn
+                FROM checks
+              )
+              WHERE rn = 1
+            ),
+            last_in_range AS (
+              SELECT monitor_id, checked_at
+              FROM (
+                SELECT
+                  monitor_id,
+                  checked_at,
+                  row_number() OVER (
+                    PARTITION BY monitor_id
+                    ORDER BY checked_at DESC
+                  ) AS rn
+                FROM checks
+                WHERE checked_at >= start_at
+              )
+              WHERE rn = 1
+            ),
+            unknown_tail AS (
+              SELECT
+                e.monitor_id AS monitor_id,
+                CASE
+                  WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+                  WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+                  ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+                END AS seg_start,
+                ?2 AS seg_end
+              FROM effective e
+              LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+              LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
+              WHERE e.start_at IS NOT NULL
+            ),
+            unknown_segments AS (
+              SELECT monitor_id, seg_start, seg_end
+              FROM unknown_checks
+              WHERE seg_end > seg_start
+              UNION ALL
+              SELECT monitor_id, seg_start, seg_end
+              FROM unknown_tail
+              WHERE seg_end > seg_start
+            ),
+            unknown_raw AS (
+              SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+              FROM unknown_segments
+              GROUP BY monitor_id
+            ),
+            unknown_overlap AS (
+              SELECT
+                u.monitor_id AS monitor_id,
+                sum(
+                  max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+                ) AS overlap_sec
+              FROM unknown_segments u
+              JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+              WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+              GROUP BY u.monitor_id
+            )
+            SELECT
+              e.start_at AS start_at,
+              (?2 - e.start_at) AS total_sec,
+              coalesce(d.downtime_sec, 0) AS downtime_sec,
+              max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+            FROM effective e
+            LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+            LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+            LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+            WHERE e.start_at IS NOT NULL
+          `,
+        )
+        .bind(rangeStart, rangeEnd, monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at),
+    );
+  } else {
+    const startPartialEnd = Math.min(rangeEnd, startDay + 86400);
+    windowIndexes.startPartial = windowBatchStatements.length;
+    windowBatchStatements.push(
+      c.env.DB
+        .prepare(
+          `
+            WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+              VALUES (?3, ?4, ?5, ?6)
+            ),
+            first_checks AS (
+              SELECT monitor_id, MIN(checked_at) AS first_check_at
+              FROM check_results
+              WHERE monitor_id IN (SELECT monitor_id FROM input)
+                AND checked_at >= ?1
+                AND checked_at < ?2
+              GROUP BY monitor_id
+            ),
+            effective AS (
+              SELECT
+                i.monitor_id AS monitor_id,
+                i.interval_sec AS interval_sec,
+                CASE
+                  WHEN i.created_at >= ?1 THEN
+                    COALESCE(
+                      fc.first_check_at,
+                      CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
+                    )
+                  ELSE ?1
+                END AS start_at
+              FROM input i
+              LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+            ),
+            downtime_segments AS (
+              SELECT
+                o.monitor_id AS monitor_id,
+                max(o.started_at, e.start_at) AS seg_start,
+                min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+              FROM outages o
+              JOIN effective e ON e.monitor_id = o.monitor_id
+              WHERE e.start_at IS NOT NULL
+                AND o.started_at < ?2
+                AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+            ),
+            downtime AS (
+              SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+              FROM downtime_segments
+              GROUP BY monitor_id
+            ),
+            checks AS (
+              SELECT
+                cr.monitor_id AS monitor_id,
+                cr.checked_at AS checked_at,
+                cr.status AS status,
+                e.interval_sec AS interval_sec,
+                e.start_at AS start_at,
+                lag(cr.checked_at) OVER (
+                  PARTITION BY cr.monitor_id
+                  ORDER BY cr.checked_at
+                ) AS prev_at,
+                lag(cr.status) OVER (
+                  PARTITION BY cr.monitor_id
+                  ORDER BY cr.checked_at
+                ) AS prev_status
+              FROM check_results cr
+              JOIN effective e ON e.monitor_id = cr.monitor_id
+              WHERE e.start_at IS NOT NULL
+                AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+                AND cr.checked_at < ?2
+            ),
+            unknown_checks AS (
+              SELECT
+                monitor_id AS monitor_id,
+                CASE
+                  WHEN prev_at IS NULL THEN start_at
+                  WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+                  ELSE max(
+                    (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+                    prev_at + interval_sec * 2
+                  )
+                END AS seg_start,
+                checked_at AS seg_end
+              FROM checks
+              WHERE checked_at >= start_at
+            ),
+            last_any AS (
+              SELECT monitor_id, checked_at, status
+              FROM (
+                SELECT
+                  monitor_id,
+                  checked_at,
+                  status,
+                  row_number() OVER (
+                    PARTITION BY monitor_id
+                    ORDER BY checked_at DESC
+                  ) AS rn
+                FROM checks
+              )
+              WHERE rn = 1
+            ),
+            last_in_range AS (
+              SELECT monitor_id, checked_at
+              FROM (
+                SELECT
+                  monitor_id,
+                  checked_at,
+                  row_number() OVER (
+                    PARTITION BY monitor_id
+                    ORDER BY checked_at DESC
+                  ) AS rn
+                FROM checks
+                WHERE checked_at >= start_at
+              )
+              WHERE rn = 1
+            ),
+            unknown_tail AS (
+              SELECT
+                e.monitor_id AS monitor_id,
+                CASE
+                  WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+                  WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+                  ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+                END AS seg_start,
+                ?2 AS seg_end
+              FROM effective e
+              LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+              LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
+              WHERE e.start_at IS NOT NULL
+            ),
+            unknown_segments AS (
+              SELECT monitor_id, seg_start, seg_end
+              FROM unknown_checks
+              WHERE seg_end > seg_start
+              UNION ALL
+              SELECT monitor_id, seg_start, seg_end
+              FROM unknown_tail
+              WHERE seg_end > seg_start
+            ),
+            unknown_raw AS (
+              SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+              FROM unknown_segments
+              GROUP BY monitor_id
+            ),
+            unknown_overlap AS (
+              SELECT
+                u.monitor_id AS monitor_id,
+                sum(
+                  max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+                ) AS overlap_sec
+              FROM unknown_segments u
+              JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+              WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+              GROUP BY u.monitor_id
+            )
+            SELECT
+              e.start_at AS start_at,
+              (?2 - e.start_at) AS total_sec,
+              coalesce(d.downtime_sec, 0) AS downtime_sec,
+              max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+            FROM effective e
+            LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+            LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+            LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+            WHERE e.start_at IS NOT NULL
+          `,
+        )
+        .bind(rangeStart, startPartialEnd, monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at),
+    );
+
+    const fullDaysStart = Math.max(startDay + 86400, rangeStart);
+    const fullDaysEnd = endDay;
+    if (fullDaysStart < fullDaysEnd) {
+      windowIndexes.rollup = windowBatchStatements.length;
+      windowBatchStatements.push(
+        c.env.DB
+          .prepare(
+            `
+              SELECT
+                SUM(total_sec) AS total_sec,
+                SUM(downtime_sec) AS downtime_sec,
+                SUM(unknown_sec) AS unknown_sec,
+                SUM(uptime_sec) AS uptime_sec
+              FROM monitor_daily_rollups
+              WHERE monitor_id = ?1
+                AND day_start_at >= ?2
+                AND day_start_at < ?3
+            `,
+          )
+          .bind(monitor.id, fullDaysStart, fullDaysEnd),
+      );
+    }
+
+    if (endDay < rangeEnd) {
+      windowIndexes.runtime = windowBatchStatements.length;
+      windowBatchStatements.push(
+        c.env.DB
+          .prepare(
+            `
+              SELECT
+                generated_at,
+                CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
+                (
+                  SELECT entry.value
+                  FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
+                  WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
+                  LIMIT 1
+                ) AS monitor_json
+              FROM public_snapshots
+              WHERE key = ?1
+            `,
+          )
+          .bind(MONITOR_RUNTIME_SNAPSHOT_KEY, monitor.id),
+      );
+    }
+  }
+
+  const windowResults =
+    windowBatchStatements.length === 0
+      ? []
+      : await trace.timeAsync('window_queries', async () => await c.env.DB.batch(windowBatchStatements));
+
+  const firstCheckAt =
+    windowIndexes.firstCheck === -1
+      ? null
+      : takeBatchFirstRow<{ checked_at: number }>(windowResults[windowIndexes.firstCheck])?.checked_at ?? null;
+  const effectiveRangeStart = resolveUptimeRangeStartFromFirstCheck({
+    rangeStart,
+    rangeEnd,
+    monitorCreatedAt: monitor.created_at,
+    lastCheckedAt: monitor.last_checked_at,
+    firstCheckAt,
+  });
   const rangeStartAt = effectiveRangeStart ?? rangeStart;
   if (effectiveRangeStart === null || rangeEnd <= effectiveRangeStart) {
     const res = withVisibilityAwareCaching(
@@ -1562,100 +1988,95 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     unknown_sec: 0,
     uptime_sec: 0,
   };
-  const startDay = utcDayStart(effectiveRangeStart);
-  const endDay = utcDayStart(rangeEnd);
 
   if (startDay === endDay) {
-    addUptimeTotals(totals, await trace.timeAsync('single_partial', async () =>
-      await computePartialUptimeTotals(
-        c.env.DB,
-        monitor.id,
-        monitor.interval_sec,
-        monitor.created_at,
-        monitor.last_checked_at,
-        effectiveRangeStart,
-        rangeEnd,
-      ),
-    ));
+    const singlePartial = takeBatchFirstRow<{
+      start_at: number | null;
+      total_sec: number | null;
+      downtime_sec: number | null;
+      unknown_sec: number | null;
+    }>(windowResults[windowIndexes.singlePartial]);
+
+    if (singlePartial?.start_at !== null && singlePartial?.start_at !== undefined) {
+      const total_sec = Math.max(0, singlePartial.total_sec ?? 0);
+      const downtime_sec = Math.max(0, singlePartial.downtime_sec ?? 0);
+      const unknown_sec = Math.max(0, singlePartial.unknown_sec ?? 0);
+      const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
+      addUptimeTotals(totals, {
+        total_sec,
+        downtime_sec,
+        unknown_sec,
+        uptime_sec: Math.max(0, total_sec - unavailable_sec),
+      });
+    }
   } else {
-    const startPartialEnd = Math.min(rangeEnd, startDay + 86400);
-    if (effectiveRangeStart < startPartialEnd) {
-      addUptimeTotals(totals, await trace.timeAsync('start_partial', async () =>
+    const startPartial = takeBatchFirstRow<{
+      start_at: number | null;
+      total_sec: number | null;
+      downtime_sec: number | null;
+      unknown_sec: number | null;
+    }>(windowResults[windowIndexes.startPartial]);
+
+    if (
+      startPartial?.start_at !== null &&
+      startPartial?.start_at !== undefined &&
+      effectiveRangeStart < Math.min(rangeEnd, startDay + 86400)
+    ) {
+      const total_sec = Math.max(0, startPartial.total_sec ?? 0);
+      const downtime_sec = Math.max(0, startPartial.downtime_sec ?? 0);
+      const unknown_sec = Math.max(0, startPartial.unknown_sec ?? 0);
+      const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
+      addUptimeTotals(totals, {
+        total_sec,
+        downtime_sec,
+        unknown_sec,
+        uptime_sec: Math.max(0, total_sec - unavailable_sec),
+      });
+    }
+
+    const rollup = takeBatchFirstRow<{
+      total_sec: number | null;
+      downtime_sec: number | null;
+      unknown_sec: number | null;
+      uptime_sec: number | null;
+    }>(windowIndexes.rollup === -1 ? null : windowResults[windowIndexes.rollup]);
+    if (rollup) {
+      addUptimeTotals(totals, {
+        total_sec: rollup.total_sec ?? 0,
+        downtime_sec: rollup.downtime_sec ?? 0,
+        unknown_sec: rollup.unknown_sec ?? 0,
+        uptime_sec: rollup.uptime_sec ?? 0,
+      });
+    }
+
+    const runtimeEntryRow = takeBatchFirstRow<{
+      generated_at: number;
+      day_start_at: number | null;
+      monitor_json: string | null;
+    }>(windowIndexes.runtime === -1 ? null : windowResults[windowIndexes.runtime]);
+    const runtimeEntry =
+      runtimeEntryRow &&
+      typeof runtimeEntryRow.generated_at === 'number' &&
+      Math.max(0, rangeEnd - runtimeEntryRow.generated_at) <= MONITOR_RUNTIME_MAX_AGE_SECONDS &&
+      runtimeEntryRow.day_start_at === utcDayStart(rangeEnd) &&
+      typeof runtimeEntryRow.monitor_json === 'string'
+        ? parsePublicMonitorRuntimeEntry(safeJsonParse(runtimeEntryRow.monitor_json))
+        : null;
+
+    if (runtimeEntry) {
+      addUptimeTotals(totals, materializeMonitorRuntimeTotals(runtimeEntry, rangeEnd));
+    } else if (endDay < rangeEnd) {
+      addUptimeTotals(totals, await trace.timeAsync('end_partial_fallback', async () =>
         await computePartialUptimeTotals(
           c.env.DB,
           monitor.id,
           monitor.interval_sec,
           monitor.created_at,
           monitor.last_checked_at,
-          effectiveRangeStart,
-          startPartialEnd,
+          endDay,
+          rangeEnd,
         ),
       ));
-    }
-
-    const fullDaysStart = Math.max(startDay + 86400, effectiveRangeStart);
-    const fullDaysEnd = endDay;
-    if (fullDaysStart < fullDaysEnd) {
-      const rollup = await trace.timeAsync(
-        'rollup_sum',
-        async () =>
-          await c.env.DB
-            .prepare(
-              `
-                SELECT
-                  SUM(total_sec) AS total_sec,
-                  SUM(downtime_sec) AS downtime_sec,
-                  SUM(unknown_sec) AS unknown_sec,
-                  SUM(uptime_sec) AS uptime_sec
-                FROM monitor_daily_rollups
-                WHERE monitor_id = ?1
-                  AND day_start_at >= ?2
-                  AND day_start_at < ?3
-              `,
-            )
-            .bind(monitor.id, fullDaysStart, fullDaysEnd)
-            .first<{
-              total_sec: number | null;
-              downtime_sec: number | null;
-              unknown_sec: number | null;
-              uptime_sec: number | null;
-            }>(),
-      );
-
-      addUptimeTotals(totals, {
-        total_sec: rollup?.total_sec ?? 0,
-        downtime_sec: rollup?.downtime_sec ?? 0,
-        unknown_sec: rollup?.unknown_sec ?? 0,
-        uptime_sec: rollup?.uptime_sec ?? 0,
-      });
-    }
-
-    if (endDay < rangeEnd) {
-      const runtimeEntry = await trace.timeAsync(
-        'runtime_entry',
-        async () =>
-          await readPublicMonitorRuntimeEntry({
-            db: c.env.DB,
-            now: rangeEnd,
-            monitorId: monitor.id,
-          }),
-      );
-
-      if (runtimeEntry) {
-        addUptimeTotals(totals, materializeMonitorRuntimeTotals(runtimeEntry, rangeEnd));
-      } else {
-        addUptimeTotals(totals, await trace.timeAsync('end_partial_fallback', async () =>
-          await computePartialUptimeTotals(
-            c.env.DB,
-            monitor.id,
-            monitor.interval_sec,
-            monitor.created_at,
-            monitor.last_checked_at,
-            endDay,
-            rangeEnd,
-          ),
-        ));
-      }
     }
   }
 
