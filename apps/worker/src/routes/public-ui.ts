@@ -17,7 +17,7 @@ import {
   materializeMonitorRuntimeTotals,
   MONITOR_RUNTIME_MAX_AGE_SECONDS,
   MONITOR_RUNTIME_SNAPSHOT_KEY,
-  parsePublicMonitorRuntimeEntry,
+  parsePublicMonitorRuntimeEntryJson,
   readPublicMonitorRuntimeSnapshot,
   snapshotHasMonitorIds,
   toMonitorRuntimeEntryMap,
@@ -66,6 +66,25 @@ function createTrace(c: {
       env: c.env as unknown as Record<string, unknown>,
     }),
   );
+}
+
+const publicUiStatementsByDb = new WeakMap<D1Database, Map<string, D1PreparedStatement>>();
+
+function preparePublicUiStatement(db: D1Database, sql: string): D1PreparedStatement {
+  let statements = publicUiStatementsByDb.get(db);
+  if (!statements) {
+    statements = new Map<string, D1PreparedStatement>();
+    publicUiStatementsByDb.set(db, statements);
+  }
+
+  const cached = statements.get(sql);
+  if (cached) {
+    return cached;
+  }
+
+  const statement = db.prepare(sql);
+  statements.set(sql, statement);
+  return statement;
 }
 
 const latencyRangeSchema = z.enum(['24h']);
@@ -363,16 +382,6 @@ function jsonArrayLiteral(value: string | null | undefined): string {
   if (typeof value !== 'string') return '[]';
   const trimmed = value.trim();
   return trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed : '[]';
-}
-
-function safeJsonParse(text: string): unknown | null {
-  const trimmed = text.trim();
-  if (!trimmed) return null;
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return null;
-  }
 }
 
 function takeBatchRows<T>(result: { results?: unknown[] | undefined } | null | undefined): T[] {
@@ -1035,43 +1044,43 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
     'primary_queries',
     async () =>
       await c.env.DB.batch([
-        c.env.DB
-          .prepare(
-            `
-              SELECT id
-              FROM monitors
-              WHERE id = ?1 AND is_active = 1
-                AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
-            `,
-          )
+        preparePublicUiStatement(
+          c.env.DB,
+          `
+            SELECT id
+            FROM monitors
+            WHERE id = ?1 AND is_active = 1
+              AND ${monitorVisibilityPredicate(includeHiddenMonitors)}
+          `,
+        )
           .bind(id),
-        c.env.DB
-          .prepare(
-            `
-              SELECT mw.id, mw.title, mw.message, mw.starts_at, mw.ends_at, mw.created_at
-              FROM maintenance_windows mw
-              JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
-              WHERE mwm.monitor_id = ?1
-                AND mw.starts_at < ?3
-                AND mw.ends_at > ?2
-              ORDER BY mw.starts_at ASC, mw.id ASC
-              LIMIT 50
-            `,
-          )
+        preparePublicUiStatement(
+          c.env.DB,
+          `
+            SELECT mw.id, mw.title, mw.message, mw.starts_at, mw.ends_at, mw.created_at
+            FROM maintenance_windows mw
+            JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
+            WHERE mwm.monitor_id = ?1
+              AND mw.starts_at < ?3
+              AND mw.ends_at > ?2
+            ORDER BY mw.starts_at ASC, mw.id ASC
+            LIMIT 50
+          `,
+        )
           .bind(id, dayStartAt, dayEndAt),
-        c.env.DB
-          .prepare(
-            `
-              SELECT i.id, i.title, i.status, i.impact, i.message, i.started_at, i.resolved_at
-              FROM incidents i
-              JOIN incident_monitors im ON im.incident_id = i.id
-              WHERE im.monitor_id = ?1
-                AND i.started_at < ?3
-                AND (i.resolved_at IS NULL OR i.resolved_at > ?2)
-              ORDER BY i.started_at ASC, i.id ASC
-              LIMIT 50
-            `,
-          )
+        preparePublicUiStatement(
+          c.env.DB,
+          `
+            SELECT i.id, i.title, i.status, i.impact, i.message, i.started_at, i.resolved_at
+            FROM incidents i
+            JOIN incident_monitors im ON im.incident_id = i.id
+            WHERE im.monitor_id = ?1
+              AND i.started_at < ?3
+              AND (i.resolved_at IS NULL OR i.resolved_at > ?2)
+            ORDER BY i.started_at ASC, i.id ASC
+            LIMIT 50
+          `,
+        )
           .bind(id, dayStartAt, dayEndAt),
       ]),
   );
@@ -1109,15 +1118,15 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
     expansionIndexes.windowMonitorIds = expansionStatements.length;
     const placeholders = buildNumberedPlaceholders(maintenanceIds.length);
     expansionStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            SELECT maintenance_window_id, monitor_id
-            FROM maintenance_window_monitors
-            WHERE maintenance_window_id IN (${placeholders})
-            ORDER BY maintenance_window_id, monitor_id
-          `,
-        )
+      preparePublicUiStatement(
+        c.env.DB,
+        `
+          SELECT maintenance_window_id, monitor_id
+          FROM maintenance_window_monitors
+          WHERE maintenance_window_id IN (${placeholders})
+          ORDER BY maintenance_window_id, monitor_id
+        `,
+      )
         .bind(...maintenanceIds),
     );
   }
@@ -1126,29 +1135,29 @@ publicUiRoutes.get('/monitors/:id/day-context', async (c) => {
     const placeholders = buildNumberedPlaceholders(incidentIds.length);
     expansionIndexes.incidentUpdates = expansionStatements.length;
     expansionStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            SELECT id, incident_id, status, message, created_at
-            FROM incident_updates
-            WHERE incident_id IN (${placeholders})
-            ORDER BY incident_id, created_at, id
-          `,
-        )
+      preparePublicUiStatement(
+        c.env.DB,
+        `
+          SELECT id, incident_id, status, message, created_at
+          FROM incident_updates
+          WHERE incident_id IN (${placeholders})
+          ORDER BY incident_id, created_at, id
+        `,
+      )
         .bind(...incidentIds),
     );
 
     expansionIndexes.incidentMonitorIds = expansionStatements.length;
     expansionStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            SELECT incident_id, monitor_id
-            FROM incident_monitors
-            WHERE incident_id IN (${placeholders})
-            ORDER BY incident_id, monitor_id
-          `,
-        )
+      preparePublicUiStatement(
+        c.env.DB,
+        `
+          SELECT incident_id, monitor_id
+          FROM incident_monitors
+          WHERE incident_id IN (${placeholders})
+          ORDER BY incident_id, monitor_id
+        `,
+      )
         .bind(...incidentIds),
     );
   }
@@ -1379,28 +1388,28 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
   const { results: monitorRows } = await trace.timeAsync(
     'monitor_rollups',
     async () =>
-      await c.env.DB
-        .prepare(
-          `
-            SELECT
-              m.id,
-              m.name,
-              m.type,
-              COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
-              COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
-              COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
-              COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
-            FROM monitors m
-            LEFT JOIN monitor_daily_rollups r
-              ON r.monitor_id = m.id
-             AND r.day_start_at >= ?1
-             AND r.day_start_at < ?2
-            WHERE m.is_active = 1
-              AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-            GROUP BY m.id, m.name, m.type
-            ORDER BY m.id
-          `,
-        )
+      await preparePublicUiStatement(
+        c.env.DB,
+        `
+          SELECT
+            m.id,
+            m.name,
+            m.type,
+            COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
+            COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
+            COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
+            COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
+          FROM monitors m
+          LEFT JOIN monitor_daily_rollups r
+            ON r.monitor_id = m.id
+           AND r.day_start_at >= ?1
+           AND r.day_start_at < ?2
+          WHERE m.is_active = 1
+            AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+          GROUP BY m.id, m.name, m.type
+          ORDER BY m.id
+        `,
+      )
         .bind(rangeStart, rangeEndFullDays)
         .all<{
           id: number;
@@ -1519,375 +1528,375 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
 
   windowIndexes.monitor = windowBatchStatements.length;
   windowBatchStatements.push(
-    c.env.DB
-      .prepare(
-        `
-          SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
-          FROM monitors m
-          LEFT JOIN monitor_state s ON s.monitor_id = m.id
-          WHERE m.id = ?1 AND m.is_active = 1
-            AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-        `,
-      )
+    preparePublicUiStatement(
+      c.env.DB,
+      `
+        SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
+        FROM monitors m
+        LEFT JOIN monitor_state s ON s.monitor_id = m.id
+        WHERE m.id = ?1 AND m.is_active = 1
+          AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+      `,
+    )
       .bind(id),
   );
 
   windowIndexes.firstCheck = windowBatchStatements.length;
   windowBatchStatements.push(
-    c.env.DB
-      .prepare(
-        `
-          SELECT checked_at
-          FROM check_results
-          WHERE monitor_id = ?1
-            AND checked_at >= ?2
-            AND checked_at < ?3
-          ORDER BY checked_at
-          LIMIT 1
-        `,
-      )
+    preparePublicUiStatement(
+      c.env.DB,
+      `
+        SELECT checked_at
+        FROM check_results
+        WHERE monitor_id = ?1
+          AND checked_at >= ?2
+          AND checked_at < ?3
+        ORDER BY checked_at
+        LIMIT 1
+      `,
+    )
       .bind(id, requestedRangeStart, rangeEnd),
   );
 
   if (startDay === endDay) {
     windowIndexes.singlePartial = windowBatchStatements.length;
     windowBatchStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
-              SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
-              FROM monitors m
-              LEFT JOIN monitor_state s ON s.monitor_id = m.id
-              WHERE m.id = ?3
-            ),
-            first_checks AS (
-              SELECT monitor_id, MIN(checked_at) AS first_check_at
-              FROM check_results
-              WHERE monitor_id IN (SELECT monitor_id FROM input)
-                AND checked_at >= ?1
-                AND checked_at < ?2
-              GROUP BY monitor_id
-            ),
-            effective AS (
-              SELECT
-                i.monitor_id AS monitor_id,
-                i.interval_sec AS interval_sec,
-                CASE
-                  WHEN i.created_at >= ?1 THEN
-                    COALESCE(
-                      fc.first_check_at,
-                      CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
-                    )
-                  ELSE ?1
-                END AS start_at
-              FROM input i
-              LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
-            ),
-            downtime_segments AS (
-              SELECT
-                o.monitor_id AS monitor_id,
-                max(o.started_at, e.start_at) AS seg_start,
-                min(coalesce(o.ended_at, ?2), ?2) AS seg_end
-              FROM outages o
-              JOIN effective e ON e.monitor_id = o.monitor_id
-              WHERE e.start_at IS NOT NULL
-                AND o.started_at < ?2
-                AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
-            ),
-            downtime AS (
-              SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
-              FROM downtime_segments
-              GROUP BY monitor_id
-            ),
-            checks AS (
-              SELECT
-                cr.monitor_id AS monitor_id,
-                cr.checked_at AS checked_at,
-                cr.status AS status,
-                e.interval_sec AS interval_sec,
-                e.start_at AS start_at,
-                lag(cr.checked_at) OVER (
-                  PARTITION BY cr.monitor_id
-                  ORDER BY cr.checked_at
-                ) AS prev_at,
-                lag(cr.status) OVER (
-                  PARTITION BY cr.monitor_id
-                  ORDER BY cr.checked_at
-                ) AS prev_status
-              FROM check_results cr
-              JOIN effective e ON e.monitor_id = cr.monitor_id
-              WHERE e.start_at IS NOT NULL
-                AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
-                AND cr.checked_at < ?2
-            ),
-            unknown_checks AS (
-              SELECT
-                monitor_id AS monitor_id,
-                CASE
-                  WHEN prev_at IS NULL THEN start_at
-                  WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
-                  ELSE max(
-                    (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
-                    prev_at + interval_sec * 2
+      preparePublicUiStatement(
+        c.env.DB,
+        `
+          WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+            SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
+            FROM monitors m
+            LEFT JOIN monitor_state s ON s.monitor_id = m.id
+            WHERE m.id = ?3
+          ),
+          first_checks AS (
+            SELECT monitor_id, MIN(checked_at) AS first_check_at
+            FROM check_results
+            WHERE monitor_id IN (SELECT monitor_id FROM input)
+              AND checked_at >= ?1
+              AND checked_at < ?2
+            GROUP BY monitor_id
+          ),
+          effective AS (
+            SELECT
+              i.monitor_id AS monitor_id,
+              i.interval_sec AS interval_sec,
+              CASE
+                WHEN i.created_at >= ?1 THEN
+                  COALESCE(
+                    fc.first_check_at,
+                    CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
                   )
-                END AS seg_start,
-                checked_at AS seg_end
+                ELSE ?1
+              END AS start_at
+            FROM input i
+            LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+          ),
+          downtime_segments AS (
+            SELECT
+              o.monitor_id AS monitor_id,
+              max(o.started_at, e.start_at) AS seg_start,
+              min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+            FROM outages o
+            JOIN effective e ON e.monitor_id = o.monitor_id
+            WHERE e.start_at IS NOT NULL
+              AND o.started_at < ?2
+              AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+          ),
+          downtime AS (
+            SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+            FROM downtime_segments
+            GROUP BY monitor_id
+          ),
+          checks AS (
+            SELECT
+              cr.monitor_id AS monitor_id,
+              cr.checked_at AS checked_at,
+              cr.status AS status,
+              e.interval_sec AS interval_sec,
+              e.start_at AS start_at,
+              lag(cr.checked_at) OVER (
+                PARTITION BY cr.monitor_id
+                ORDER BY cr.checked_at
+              ) AS prev_at,
+              lag(cr.status) OVER (
+                PARTITION BY cr.monitor_id
+                ORDER BY cr.checked_at
+              ) AS prev_status
+            FROM check_results cr
+            JOIN effective e ON e.monitor_id = cr.monitor_id
+            WHERE e.start_at IS NOT NULL
+              AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+              AND cr.checked_at < ?2
+          ),
+          unknown_checks AS (
+            SELECT
+              monitor_id AS monitor_id,
+              CASE
+                WHEN prev_at IS NULL THEN start_at
+                WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+                ELSE max(
+                  (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+                  prev_at + interval_sec * 2
+                )
+              END AS seg_start,
+              checked_at AS seg_end
+            FROM checks
+            WHERE checked_at >= start_at
+          ),
+          last_any AS (
+            SELECT monitor_id, checked_at, status
+            FROM (
+              SELECT
+                monitor_id,
+                checked_at,
+                status,
+                row_number() OVER (
+                  PARTITION BY monitor_id
+                  ORDER BY checked_at DESC
+                ) AS rn
+              FROM checks
+            )
+            WHERE rn = 1
+          ),
+          last_in_range AS (
+            SELECT monitor_id, checked_at
+            FROM (
+              SELECT
+                monitor_id,
+                checked_at,
+                row_number() OVER (
+                  PARTITION BY monitor_id
+                  ORDER BY checked_at DESC
+                ) AS rn
               FROM checks
               WHERE checked_at >= start_at
-            ),
-            last_any AS (
-              SELECT monitor_id, checked_at, status
-              FROM (
-                SELECT
-                  monitor_id,
-                  checked_at,
-                  status,
-                  row_number() OVER (
-                    PARTITION BY monitor_id
-                    ORDER BY checked_at DESC
-                  ) AS rn
-                FROM checks
-              )
-              WHERE rn = 1
-            ),
-            last_in_range AS (
-              SELECT monitor_id, checked_at
-              FROM (
-                SELECT
-                  monitor_id,
-                  checked_at,
-                  row_number() OVER (
-                    PARTITION BY monitor_id
-                    ORDER BY checked_at DESC
-                  ) AS rn
-                FROM checks
-                WHERE checked_at >= start_at
-              )
-              WHERE rn = 1
-            ),
-            unknown_tail AS (
-              SELECT
-                e.monitor_id AS monitor_id,
-                CASE
-                  WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
-                  WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
-                  ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
-                END AS seg_start,
-                ?2 AS seg_end
-              FROM effective e
-              LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
-              LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
-              WHERE e.start_at IS NOT NULL
-            ),
-            unknown_segments AS (
-              SELECT monitor_id, seg_start, seg_end
-              FROM unknown_checks
-              WHERE seg_end > seg_start
-              UNION ALL
-              SELECT monitor_id, seg_start, seg_end
-              FROM unknown_tail
-              WHERE seg_end > seg_start
-            ),
-            unknown_raw AS (
-              SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
-              FROM unknown_segments
-              GROUP BY monitor_id
-            ),
-            unknown_overlap AS (
-              SELECT
-                u.monitor_id AS monitor_id,
-                sum(
-                  max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
-                ) AS overlap_sec
-              FROM unknown_segments u
-              JOIN downtime_segments d ON d.monitor_id = u.monitor_id
-              WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
-              GROUP BY u.monitor_id
             )
+            WHERE rn = 1
+          ),
+          unknown_tail AS (
             SELECT
-              e.start_at AS start_at,
-              (?2 - e.start_at) AS total_sec,
-              coalesce(d.downtime_sec, 0) AS downtime_sec,
-              max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+              e.monitor_id AS monitor_id,
+              CASE
+                WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+                WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+                ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+              END AS seg_start,
+              ?2 AS seg_end
             FROM effective e
-            LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
-            LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
-            LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+            LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+            LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
             WHERE e.start_at IS NOT NULL
-          `,
-        )
+          ),
+          unknown_segments AS (
+            SELECT monitor_id, seg_start, seg_end
+            FROM unknown_checks
+            WHERE seg_end > seg_start
+            UNION ALL
+            SELECT monitor_id, seg_start, seg_end
+            FROM unknown_tail
+            WHERE seg_end > seg_start
+          ),
+          unknown_raw AS (
+            SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+            FROM unknown_segments
+            GROUP BY monitor_id
+          ),
+          unknown_overlap AS (
+            SELECT
+              u.monitor_id AS monitor_id,
+              sum(
+                max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+              ) AS overlap_sec
+            FROM unknown_segments u
+            JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+            WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+            GROUP BY u.monitor_id
+          )
+          SELECT
+            e.start_at AS start_at,
+            (?2 - e.start_at) AS total_sec,
+            coalesce(d.downtime_sec, 0) AS downtime_sec,
+            max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+          FROM effective e
+          LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+          LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+          LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+          WHERE e.start_at IS NOT NULL
+        `,
+      )
         .bind(requestedRangeStart, rangeEnd, id),
     );
   } else {
     const startPartialEnd = Math.min(rangeEnd, startDay + 86400);
     windowIndexes.startPartial = windowBatchStatements.length;
     windowBatchStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
-              SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
-              FROM monitors m
-              LEFT JOIN monitor_state s ON s.monitor_id = m.id
-              WHERE m.id = ?3
-            ),
-            first_checks AS (
-              SELECT monitor_id, MIN(checked_at) AS first_check_at
-              FROM check_results
-              WHERE monitor_id IN (SELECT monitor_id FROM input)
-                AND checked_at >= ?1
-                AND checked_at < ?2
-              GROUP BY monitor_id
-            ),
-            effective AS (
-              SELECT
-                i.monitor_id AS monitor_id,
-                i.interval_sec AS interval_sec,
-                CASE
-                  WHEN i.created_at >= ?1 THEN
-                    COALESCE(
-                      fc.first_check_at,
-                      CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
-                    )
-                  ELSE ?1
-                END AS start_at
-              FROM input i
-              LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
-            ),
-            downtime_segments AS (
-              SELECT
-                o.monitor_id AS monitor_id,
-                max(o.started_at, e.start_at) AS seg_start,
-                min(coalesce(o.ended_at, ?2), ?2) AS seg_end
-              FROM outages o
-              JOIN effective e ON e.monitor_id = o.monitor_id
-              WHERE e.start_at IS NOT NULL
-                AND o.started_at < ?2
-                AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
-            ),
-            downtime AS (
-              SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
-              FROM downtime_segments
-              GROUP BY monitor_id
-            ),
-            checks AS (
-              SELECT
-                cr.monitor_id AS monitor_id,
-                cr.checked_at AS checked_at,
-                cr.status AS status,
-                e.interval_sec AS interval_sec,
-                e.start_at AS start_at,
-                lag(cr.checked_at) OVER (
-                  PARTITION BY cr.monitor_id
-                  ORDER BY cr.checked_at
-                ) AS prev_at,
-                lag(cr.status) OVER (
-                  PARTITION BY cr.monitor_id
-                  ORDER BY cr.checked_at
-                ) AS prev_status
-              FROM check_results cr
-              JOIN effective e ON e.monitor_id = cr.monitor_id
-              WHERE e.start_at IS NOT NULL
-                AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
-                AND cr.checked_at < ?2
-            ),
-            unknown_checks AS (
-              SELECT
-                monitor_id AS monitor_id,
-                CASE
-                  WHEN prev_at IS NULL THEN start_at
-                  WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
-                  ELSE max(
-                    (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
-                    prev_at + interval_sec * 2
+      preparePublicUiStatement(
+        c.env.DB,
+        `
+          WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+            SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
+            FROM monitors m
+            LEFT JOIN monitor_state s ON s.monitor_id = m.id
+            WHERE m.id = ?3
+          ),
+          first_checks AS (
+            SELECT monitor_id, MIN(checked_at) AS first_check_at
+            FROM check_results
+            WHERE monitor_id IN (SELECT monitor_id FROM input)
+              AND checked_at >= ?1
+              AND checked_at < ?2
+            GROUP BY monitor_id
+          ),
+          effective AS (
+            SELECT
+              i.monitor_id AS monitor_id,
+              i.interval_sec AS interval_sec,
+              CASE
+                WHEN i.created_at >= ?1 THEN
+                  COALESCE(
+                    fc.first_check_at,
+                    CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
                   )
-                END AS seg_start,
-                checked_at AS seg_end
+                ELSE ?1
+              END AS start_at
+            FROM input i
+            LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+          ),
+          downtime_segments AS (
+            SELECT
+              o.monitor_id AS monitor_id,
+              max(o.started_at, e.start_at) AS seg_start,
+              min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+            FROM outages o
+            JOIN effective e ON e.monitor_id = o.monitor_id
+            WHERE e.start_at IS NOT NULL
+              AND o.started_at < ?2
+              AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+          ),
+          downtime AS (
+            SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+            FROM downtime_segments
+            GROUP BY monitor_id
+          ),
+          checks AS (
+            SELECT
+              cr.monitor_id AS monitor_id,
+              cr.checked_at AS checked_at,
+              cr.status AS status,
+              e.interval_sec AS interval_sec,
+              e.start_at AS start_at,
+              lag(cr.checked_at) OVER (
+                PARTITION BY cr.monitor_id
+                ORDER BY cr.checked_at
+              ) AS prev_at,
+              lag(cr.status) OVER (
+                PARTITION BY cr.monitor_id
+                ORDER BY cr.checked_at
+              ) AS prev_status
+            FROM check_results cr
+            JOIN effective e ON e.monitor_id = cr.monitor_id
+            WHERE e.start_at IS NOT NULL
+              AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+              AND cr.checked_at < ?2
+          ),
+          unknown_checks AS (
+            SELECT
+              monitor_id AS monitor_id,
+              CASE
+                WHEN prev_at IS NULL THEN start_at
+                WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+                ELSE max(
+                  (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+                  prev_at + interval_sec * 2
+                )
+              END AS seg_start,
+              checked_at AS seg_end
+            FROM checks
+            WHERE checked_at >= start_at
+          ),
+          last_any AS (
+            SELECT monitor_id, checked_at, status
+            FROM (
+              SELECT
+                monitor_id,
+                checked_at,
+                status,
+                row_number() OVER (
+                  PARTITION BY monitor_id
+                  ORDER BY checked_at DESC
+                ) AS rn
+              FROM checks
+            )
+            WHERE rn = 1
+          ),
+          last_in_range AS (
+            SELECT monitor_id, checked_at
+            FROM (
+              SELECT
+                monitor_id,
+                checked_at,
+                row_number() OVER (
+                  PARTITION BY monitor_id
+                  ORDER BY checked_at DESC
+                ) AS rn
               FROM checks
               WHERE checked_at >= start_at
-            ),
-            last_any AS (
-              SELECT monitor_id, checked_at, status
-              FROM (
-                SELECT
-                  monitor_id,
-                  checked_at,
-                  status,
-                  row_number() OVER (
-                    PARTITION BY monitor_id
-                    ORDER BY checked_at DESC
-                  ) AS rn
-                FROM checks
-              )
-              WHERE rn = 1
-            ),
-            last_in_range AS (
-              SELECT monitor_id, checked_at
-              FROM (
-                SELECT
-                  monitor_id,
-                  checked_at,
-                  row_number() OVER (
-                    PARTITION BY monitor_id
-                    ORDER BY checked_at DESC
-                  ) AS rn
-                FROM checks
-                WHERE checked_at >= start_at
-              )
-              WHERE rn = 1
-            ),
-            unknown_tail AS (
-              SELECT
-                e.monitor_id AS monitor_id,
-                CASE
-                  WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
-                  WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
-                  ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
-                END AS seg_start,
-                ?2 AS seg_end
-              FROM effective e
-              LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
-              LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
-              WHERE e.start_at IS NOT NULL
-            ),
-            unknown_segments AS (
-              SELECT monitor_id, seg_start, seg_end
-              FROM unknown_checks
-              WHERE seg_end > seg_start
-              UNION ALL
-              SELECT monitor_id, seg_start, seg_end
-              FROM unknown_tail
-              WHERE seg_end > seg_start
-            ),
-            unknown_raw AS (
-              SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
-              FROM unknown_segments
-              GROUP BY monitor_id
-            ),
-            unknown_overlap AS (
-              SELECT
-                u.monitor_id AS monitor_id,
-                sum(
-                  max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
-                ) AS overlap_sec
-              FROM unknown_segments u
-              JOIN downtime_segments d ON d.monitor_id = u.monitor_id
-              WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
-              GROUP BY u.monitor_id
             )
+            WHERE rn = 1
+          ),
+          unknown_tail AS (
             SELECT
-              e.start_at AS start_at,
-              (?2 - e.start_at) AS total_sec,
-              coalesce(d.downtime_sec, 0) AS downtime_sec,
-              max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+              e.monitor_id AS monitor_id,
+              CASE
+                WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+                WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+                ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+              END AS seg_start,
+              ?2 AS seg_end
             FROM effective e
-            LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
-            LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
-            LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+            LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+            LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
             WHERE e.start_at IS NOT NULL
-          `,
-        )
+          ),
+          unknown_segments AS (
+            SELECT monitor_id, seg_start, seg_end
+            FROM unknown_checks
+            WHERE seg_end > seg_start
+            UNION ALL
+            SELECT monitor_id, seg_start, seg_end
+            FROM unknown_tail
+            WHERE seg_end > seg_start
+          ),
+          unknown_raw AS (
+            SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+            FROM unknown_segments
+            GROUP BY monitor_id
+          ),
+          unknown_overlap AS (
+            SELECT
+              u.monitor_id AS monitor_id,
+              sum(
+                max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+              ) AS overlap_sec
+            FROM unknown_segments u
+            JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+            WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+            GROUP BY u.monitor_id
+          )
+          SELECT
+            e.start_at AS start_at,
+            (?2 - e.start_at) AS total_sec,
+            coalesce(d.downtime_sec, 0) AS downtime_sec,
+            max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+          FROM effective e
+          LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+          LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+          LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+          WHERE e.start_at IS NOT NULL
+        `,
+      )
         .bind(requestedRangeStart, startPartialEnd, id),
     );
 
@@ -1896,20 +1905,20 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     if (fullDaysStart < fullDaysEnd) {
       windowIndexes.rollup = windowBatchStatements.length;
       windowBatchStatements.push(
-        c.env.DB
-          .prepare(
-            `
-              SELECT
-                SUM(total_sec) AS total_sec,
-                SUM(downtime_sec) AS downtime_sec,
-                SUM(unknown_sec) AS unknown_sec,
-                SUM(uptime_sec) AS uptime_sec
-              FROM monitor_daily_rollups
-              WHERE monitor_id = ?1
-                AND day_start_at >= ?2
-                AND day_start_at < ?3
-            `,
-          )
+        preparePublicUiStatement(
+          c.env.DB,
+          `
+            SELECT
+              SUM(total_sec) AS total_sec,
+              SUM(downtime_sec) AS downtime_sec,
+              SUM(unknown_sec) AS unknown_sec,
+              SUM(uptime_sec) AS uptime_sec
+            FROM monitor_daily_rollups
+            WHERE monitor_id = ?1
+              AND day_start_at >= ?2
+              AND day_start_at < ?3
+          `,
+        )
           .bind(id, fullDaysStart, fullDaysEnd),
       );
     }
@@ -1917,22 +1926,22 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     if (endDay < rangeEnd) {
       windowIndexes.runtime = windowBatchStatements.length;
       windowBatchStatements.push(
-        c.env.DB
-          .prepare(
-            `
-              SELECT
-                generated_at,
-                CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
-                (
-                  SELECT entry.value
-                  FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
-                  WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
-                  LIMIT 1
-                ) AS monitor_json
-              FROM public_snapshots
-              WHERE key = ?1
-            `,
-          )
+        preparePublicUiStatement(
+          c.env.DB,
+          `
+            SELECT
+              generated_at,
+              CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
+              (
+                SELECT entry.value
+                FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
+                WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
+                LIMIT 1
+              ) AS monitor_json
+            FROM public_snapshots
+            WHERE key = ?1
+          `,
+        )
           .bind(MONITOR_RUNTIME_SNAPSHOT_KEY, id),
       );
     }
@@ -2067,7 +2076,7 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
       Math.max(0, rangeEnd - runtimeEntryRow.generated_at) <= MONITOR_RUNTIME_MAX_AGE_SECONDS &&
       runtimeEntryRow.day_start_at === utcDayStart(rangeEnd) &&
       typeof runtimeEntryRow.monitor_json === 'string'
-        ? parsePublicMonitorRuntimeEntry(safeJsonParse(runtimeEntryRow.monitor_json))
+        ? parsePublicMonitorRuntimeEntryJson(runtimeEntryRow.monitor_json)
         : null;
 
     if (runtimeEntry) {

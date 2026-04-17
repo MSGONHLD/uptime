@@ -372,6 +372,46 @@ export function parsePublicMonitorRuntimeEntry(value: unknown): PublicMonitorRun
   return parsed.success ? parsed.data : null;
 }
 
+const MAX_CACHED_RUNTIME_ENTRY_JSON_TEXTS = 512;
+const runtimeEntryByJsonText = new Map<string, PublicMonitorRuntimeEntry | null>();
+
+function writeCachedRuntimeEntryByJsonText(
+  jsonText: string,
+  entry: PublicMonitorRuntimeEntry | null,
+): PublicMonitorRuntimeEntry | null {
+  if (runtimeEntryByJsonText.size >= MAX_CACHED_RUNTIME_ENTRY_JSON_TEXTS) {
+    runtimeEntryByJsonText.clear();
+  }
+  runtimeEntryByJsonText.set(jsonText, entry);
+  return entry;
+}
+
+export function parsePublicMonitorRuntimeEntryJson(
+  jsonText: string | null | undefined,
+): PublicMonitorRuntimeEntry | null {
+  if (typeof jsonText !== 'string') {
+    return null;
+  }
+
+  const trimmed = jsonText.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (runtimeEntryByJsonText.has(trimmed)) {
+    return runtimeEntryByJsonText.get(trimmed) ?? null;
+  }
+
+  try {
+    return writeCachedRuntimeEntryByJsonText(
+      trimmed,
+      parsePublicMonitorRuntimeEntry(JSON.parse(trimmed) as unknown),
+    );
+  } catch {
+    return writeCachedRuntimeEntryByJsonText(trimmed, null);
+  }
+}
+
 export const publicMonitorRuntimeSnapshotSchema = z.object({
   version: z.literal(MONITOR_RUNTIME_SNAPSHOT_VERSION),
   generated_at: z.number().int().nonnegative(),

@@ -33,6 +33,29 @@ function buildCacheKey(url: string, origin: string | undefined): Request {
   return new Request(cacheUrl.toString(), { method: 'GET' });
 }
 
+const openedCachesByStorage = new WeakMap<object, Map<string, Promise<Cache>>>();
+
+function openNamedCache(name: string): Promise<Cache> {
+  const storage = globalThis.caches as unknown as object & { open(name: string): Promise<Cache> };
+  let byName = openedCachesByStorage.get(storage);
+  if (!byName) {
+    byName = new Map<string, Promise<Cache>>();
+    openedCachesByStorage.set(storage, byName);
+  }
+
+  const cached = byName.get(name);
+  if (cached) {
+    return cached;
+  }
+
+  const opened = storage.open(name).catch((error) => {
+    byName?.delete(name);
+    throw error;
+  });
+  byName.set(name, opened);
+  return opened;
+}
+
 // Cache public (unauthenticated) GET responses at the edge.
 // This reduces D1 read pressure and greatly improves TTFB on slow networks.
 //
@@ -69,7 +92,7 @@ export function cachePublic(opts: {
       }
     }
 
-    const cache = await caches.open(opts.cacheName);
+    const cache = await openNamedCache(opts.cacheName);
     const cacheKey = buildCacheKey(c.req.url, c.req.header('Origin'));
 
     const bypassCache = trace?.mode === 'bypass-cache';
