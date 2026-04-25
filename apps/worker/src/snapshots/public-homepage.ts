@@ -868,6 +868,13 @@ async function releaseRefreshLease(
 }
 
 type HomepageRefreshLeaseGuard = Pick<ReturnType<typeof startRenewableLease>, 'assertHeld'>;
+type HomepageRefreshLeaseToken = {
+  name: string;
+  expiresAt: number;
+};
+type HomepageRefreshLease = HomepageRefreshLeaseGuard & {
+  getExpiresAt: () => number;
+};
 
 export type PreparedHomepageSnapshotWrite = {
   statement: D1PreparedStatement;
@@ -926,8 +933,9 @@ export async function writeHomepageSnapshot(
   payload: PublicHomepageResponse,
   trace?: Trace,
   seedDataSnapshot = false,
+  lease?: HomepageRefreshLeaseToken,
 ): Promise<boolean> {
-  const prepared = prepareHomepageSnapshotWrite(db, now, payload, trace, seedDataSnapshot);
+  const prepared = prepareHomepageSnapshotWrite(db, now, payload, trace, seedDataSnapshot, lease);
 
   const writeResult = await withTraceAsync(trace, 'homepage_write_artifact_run', async () =>
     await prepared.statement.run(),
@@ -946,6 +954,7 @@ export async function writeHomepageArtifactSnapshot(
   now: number,
   payload: PublicHomepageResponse,
   trace?: Trace,
+  lease?: HomepageRefreshLeaseToken,
 ): Promise<boolean> {
   const render = withTraceSync(trace, 'homepage_artifact_write_render', () =>
     buildHomepageRenderArtifact(payload),
@@ -962,6 +971,7 @@ export async function writeHomepageArtifactSnapshot(
       renderBodyJson,
       now,
       now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
+      lease,
     ).run(),
   );
   const wrote = didApplySnapshotWrite(writeResult);
@@ -1004,7 +1014,7 @@ export async function refreshPublicHomepageSnapshot(opts: {
   compute: () => Promise<unknown>;
   trace?: Trace;
   seedDataSnapshot?: boolean;
-  lease?: HomepageRefreshLeaseGuard;
+  lease?: HomepageRefreshLease;
 }): Promise<boolean> {
   opts.lease?.assertHeld('computing homepage snapshot');
   const computed = await withTraceAsync(opts.trace, 'homepage_refresh_compute', async () =>
@@ -1017,10 +1027,16 @@ export async function refreshPublicHomepageSnapshot(opts: {
   return await writeHomepageSnapshot(
     opts.db,
     opts.now,
-    payload,
-    opts.trace,
-    opts.seedDataSnapshot ?? false,
-  );
+      payload,
+      opts.trace,
+      opts.seedDataSnapshot ?? false,
+      opts.lease
+        ? {
+            name: REFRESH_LOCK_NAME,
+            expiresAt: opts.lease.getExpiresAt(),
+          }
+        : undefined,
+    );
 }
 
 export async function refreshPublicHomepageArtifactSnapshot(opts: {
@@ -1028,7 +1044,7 @@ export async function refreshPublicHomepageArtifactSnapshot(opts: {
   now: number;
   compute: () => Promise<unknown>;
   trace?: Trace;
-  lease?: HomepageRefreshLeaseGuard;
+  lease?: HomepageRefreshLease;
 }): Promise<boolean> {
   opts.lease?.assertHeld('computing homepage artifact snapshot');
   const computed = await withTraceAsync(
@@ -1040,7 +1056,18 @@ export async function refreshPublicHomepageArtifactSnapshot(opts: {
     toHomepageSnapshotPayload(computed),
   );
   opts.lease?.assertHeld('writing homepage artifact snapshot');
-  return await writeHomepageArtifactSnapshot(opts.db, opts.now, payload, opts.trace);
+  return await writeHomepageArtifactSnapshot(
+    opts.db,
+    opts.now,
+    payload,
+    opts.trace,
+    opts.lease
+      ? {
+          name: REFRESH_LOCK_NAME,
+          expiresAt: opts.lease.getExpiresAt(),
+        }
+      : undefined,
+  );
 }
 
 export async function refreshPublicHomepageSnapshotIfNeeded(opts: {

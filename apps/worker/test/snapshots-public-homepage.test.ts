@@ -560,7 +560,15 @@ describe('snapshots/public-homepage', () => {
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(compute).toHaveBeenCalledTimes(1);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(storedRender), now, now + 60],
+      [
+        'homepage:artifact',
+        now,
+        JSON.stringify(storedRender),
+        now,
+        now + 60,
+        'snapshot:homepage:refresh',
+        now + 55,
+      ],
     ]);
   });
 
@@ -601,7 +609,15 @@ describe('snapshots/public-homepage', () => {
     expect(compute).toHaveBeenCalledTimes(1);
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
+      [
+        'homepage:artifact',
+        now,
+        JSON.stringify(buildHomepageRenderArtifact(payload)),
+        now,
+        now + 60,
+        'snapshot:homepage:refresh',
+        now + 55,
+      ],
     ]);
   });
 
@@ -1133,7 +1149,15 @@ describe('snapshots/public-homepage', () => {
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(compute).toHaveBeenCalledTimes(1);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
+      [
+        'homepage:artifact',
+        now,
+        JSON.stringify(buildHomepageRenderArtifact(payload)),
+        now,
+        now + 60,
+        'snapshot:homepage:refresh',
+        now + 55,
+      ],
     ]);
   });
 
@@ -1173,7 +1197,15 @@ describe('snapshots/public-homepage', () => {
     expect(compute).toHaveBeenCalledTimes(1);
     expect(releaseLease).toHaveBeenCalledWith(db, 'snapshot:homepage:refresh', now + 55);
     expect(writtenArgs).toEqual([
-      ['homepage:artifact', now, JSON.stringify(buildHomepageRenderArtifact(payload)), now, now + 60],
+      [
+        'homepage:artifact',
+        now,
+        JSON.stringify(buildHomepageRenderArtifact(payload)),
+        now,
+        now + 60,
+        'snapshot:homepage:refresh',
+        now + 55,
+      ],
     ]);
   });
 
