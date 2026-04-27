@@ -20,7 +20,7 @@ export type HttpCheckConfig = {
   responseForbiddenKeywordMode: HttpResponseMatchMode | null;
 };
 
-const USER_AGENT = 'Uptimer/0.1';
+const USER_AGENT = 'MOHBot/1.0 (Contact:monitoring@messagesonhold.com.au)';
 const RETRY_DELAYS_MS = [300, 800] as const;
 const MAX_ASSERTION_BODY_BYTES = 1024 * 1024; // 1 MiB
 
