@@ -154,6 +154,24 @@ function shouldRefreshHomepageDirect(env: Env): boolean {
   return isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_HOMEPAGE_DIRECT);
 }
 
+function readBoundedPositiveIntegerEnv(
+  env: Env,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const raw = (env as unknown as Record<string, unknown>)[key];
+  if (typeof raw !== 'string') {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, parsed));
+}
+
 async function fetchSelfWithTimeout(
   env: Env,
   request: Request,
@@ -1419,9 +1437,23 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         ? new Set<number>()
         : await notificationsModule.listMaintenanceSuppressedMonitorIds(env.DB, now, dueMonitorIds);
 
+    const internalScheduledBatchSize = readBoundedPositiveIntegerEnv(
+      env,
+      'UPTIMER_INTERNAL_SCHEDULED_BATCH_SIZE',
+      INTERNAL_SCHEDULED_BATCH_SIZE,
+      1,
+      INTERNAL_SCHEDULED_BATCH_SIZE,
+    );
+    const internalScheduledBatchConcurrency = readBoundedPositiveIntegerEnv(
+      env,
+      'UPTIMER_INTERNAL_SCHEDULED_BATCH_CONCURRENCY',
+      INTERNAL_SCHEDULED_BATCH_CONCURRENCY,
+      1,
+      INTERNAL_SCHEDULED_BATCH_CONCURRENCY,
+    );
     const serviceBatchRows =
-      env.SELF && due.length > INTERNAL_SCHEDULED_BATCH_SIZE
-        ? chunkDueMonitorRows(due, INTERNAL_SCHEDULED_BATCH_SIZE)
+      env.SELF && due.length > internalScheduledBatchSize
+        ? chunkDueMonitorRows(due, internalScheduledBatchSize)
         : null;
 
     const inlineNotificationHandler =
@@ -1451,7 +1483,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
 
     if (serviceBatchRows) {
       const batchesStart = performance.now();
-      const batchLimit = pLimit(INTERNAL_SCHEDULED_BATCH_CONCURRENCY);
+      const batchLimit = pLimit(internalScheduledBatchConcurrency);
       const batchResults = await Promise.all(
         serviceBatchRows.map((rows, batchIndex) =>
           batchLimit(async () => {

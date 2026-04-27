@@ -16,6 +16,8 @@ export interface Env {
   UPTIMER_HOMEPAGE_WRITE_LEASE_CHECK?: string;
   UPTIMER_SCHEDULED_HOMEPAGE_DIRECT?: string;
   UPTIMER_TRUST_SCHEDULED_RUNTIME_UPDATES?: string;
+  UPTIMER_INTERNAL_SCHEDULED_BATCH_SIZE?: string;
+  UPTIMER_INTERNAL_SCHEDULED_BATCH_CONCURRENCY?: string;
 
   // In-memory, per-instance rate limit for admin endpoints.
   // Keep optional so older deployments don't break.

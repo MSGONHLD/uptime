@@ -690,6 +690,73 @@ describe('scheduler/scheduled regression', () => {
     });
   });
 
+  it('honors a smaller configured internal service batch size', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const dueRows = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `API ${index + 1}`,
+      type: 'http',
+      target: `https://example.com/${index + 1}`,
+      interval_sec: 60,
+      created_at: 1_760_000_000 + index,
+      timeout_ms: 10_000,
+      http_method: 'GET',
+      http_headers_json: null,
+      http_body: null,
+      expected_status_json: null,
+      response_keyword: null,
+      response_keyword_mode: null,
+      response_forbidden_keyword: null,
+      response_forbidden_keyword_mode: null,
+      state_status: 'up',
+      state_last_error: null,
+      last_checked_at: checkedAt - 60,
+      last_changed_at: 1_760_000_000,
+      consecutive_failures: 0,
+      consecutive_successes: 1,
+    }));
+    const env = createEnv({ dueRows }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.UPTIMER_INTERNAL_SCHEDULED_BATCH_SIZE = '2';
+    const checkBatchIds: number[][] = [];
+    const selfFetch = vi.fn(async (req: Request) => {
+      const pathname = new URL(req.url).pathname;
+      if (pathname === '/api/v1/internal/scheduled/check-batch') {
+        const body = (await req.json()) as { ids: number[]; checked_at: number };
+        checkBatchIds.push(body.ids);
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            runtime_updates: [],
+            processed_count: body.ids.length,
+            rejected_count: 0,
+            attempt_total: body.ids.length,
+            http_count: body.ids.length,
+            tcp_count: 0,
+            assertion_count: 0,
+            down_count: 0,
+            unknown_count: 0,
+            checks_duration_ms: 0,
+            persist_duration_ms: 0,
+          }),
+          { status: 200 },
+        );
+      }
+      if (pathname === '/api/v1/internal/refresh/homepage') {
+        return new Response(JSON.stringify({ ok: true, refreshed: true }), { status: 200 });
+      }
+      throw new Error(`unexpected self fetch: ${pathname}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    expect(checkBatchIds).toEqual([[1, 2], [3, 4], [5, 6], [7]]);
+    expect(selfFetch).toHaveBeenCalledTimes(5);
+  });
+
   it('passes scheduler trace headers to internal check batch services', async () => {
     const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
     const dueRows = Array.from({ length: 7 }, (_, index) => ({
