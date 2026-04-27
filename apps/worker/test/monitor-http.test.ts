@@ -42,7 +42,7 @@ describe('monitor/http', () => {
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
       expect(init?.cache).toBe('no-store');
-      expect(headers.get('user-agent')).toBe('Uptimer/0.1');
+      expect(headers.get('user-agent')).toBe('MOHBot/1.0 (Contact:monitoring@messagesonhold.com.au)');
       expect((init?.cf as { cacheTtlByStatus?: unknown })?.cacheTtlByStatus).toEqual({
         '100-599': -1,
       });
